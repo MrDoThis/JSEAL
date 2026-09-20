@@ -294,7 +294,7 @@ function autoFitBoxToTemplate() {
 function createDefaultTemplate() {
   const c = document.createElement('canvas');
   c.width = 1200; c.height = 850;
-  const cctx = c.getext('2d');
+  const cctx = c.getContext('2d');
   cctx.fillStyle = '#ffffff'; cctx.fillRect(0, 0, c.width, c.height);
   cctx.strokeStyle = '#0A192F'; cctx.lineWidth = 16; cctx.strokeRect(30, 30, c.width - 60, c.height - 60);
   cctx.strokeStyle = '#cbd5e1'; cctx.lineWidth = 2; cctx.strokeRect(46, 46, c.width - 92, c.height - 92);
