@@ -4,11 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>JSeal Certificate Verification</title>
-<!-- Only one external dependency, deliberately: the Ed25519 verification
-     library. Everything else is plain HTML/CSS/JS. This page is meant to
-     keep working long after the admin Studio, and possibly the issuing
-     organization's server, are gone — fewer moving parts, fewer ways for
-     it to silently break. -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/tweetnacl/1.0.2/nacl-fast.min.js"></script>
 <style>
   :root { --bg:#0f172a; --card:#1e293b; --text:#f8fafc; --muted:#94a3b8; --ok:#10b981; --err:#ef4444; --warn:#f59e0b; --border:#334155; }
@@ -30,7 +25,7 @@
   .divider { height:1px; background:var(--border); margin:18px 0; }
   .source-note { font-size:.75rem; color:var(--muted); background:#0f172a; border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin-top:16px; }
   input[type=text] { width:100%; box-sizing:border-box; padding:10px 12px; border-radius:8px; border:1px solid var(--border);
-                      background:#0f172a; color:var(--text); font-size:.9rem; margin-bottom:10px; }
+                     background:#0f172a; color:var(--text); font-size:.9rem; margin-bottom:10px; }
   button { width:100%; padding:10px; border-radius:8px; border:none; background:#4f46e5; color:#fff; font-weight:600; cursor:pointer; font-size:.9rem; }
   button:hover { background:#4338ca; }
 </style>
@@ -53,6 +48,7 @@
       <div class="field"><div class="label">Recipient Name</div><div class="value" id="outName">--</div></div>
       <div class="field"><div class="label">Event / Issuer ID</div><div class="value" id="outEvent">--</div></div>
       <div class="field"><div class="label">Issued</div><div class="value" id="outIssued">--</div></div>
+      <div class="field"><div class="label">Data Hash</div><div class="value" id="outDataHash" style="font-size:0.75rem; color:var(--muted);">--</div></div>
       <div class="field"><div class="label">Ed25519 Signature</div><div class="value" id="outSig">--</div></div>
     </div>
 
@@ -60,17 +56,9 @@
   </div>
 
 <script>
-  // ---------------------------------------------------------------
-  // CONFIG — updated to point to your live Render backend
-  // ---------------------------------------------------------------
   const CONFIG = {
-    // Live backend API URL on Render
     ADMIN_API_URL: "https://jseal-service.onrender.com",
-
-    // Permanent fallback. Default is the real public Arweave gateway
     ARWEAVE_GATEWAY: "https://arweave.net",
-
-    // The published JSeal signing public key
     PUBLIC_KEY_HEX: "9cc0301d9c91e7c4890fdb82b97ba571a9990c4a8ec0101878857cbe5cd6d2e9"
   };
 
@@ -79,6 +67,7 @@
     for (let i = 0; i < hex.length; i += 2) bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
     return bytes;
   }
+
   function canonicalize(payload) {
     const sorted = {};
     Object.keys(payload).sort().forEach(k => sorted[k] = payload[k]);
@@ -97,6 +86,7 @@
     document.getElementById('outName').innerText = record.recipient_name;
     document.getElementById('outEvent').innerText = record.event_id;
     document.getElementById('outIssued').innerText = record.issued_at;
+    document.getElementById('outDataHash').innerText = record.data_hash || '--';
     document.getElementById('outSig').innerText = record.signature;
   }
 
@@ -130,6 +120,7 @@
         recipient_name: bundle.payload.recipient_name,
         event_id: bundle.payload.event_id,
         issued_at: bundle.payload.issued_at,
+        data_hash: bundle.payload.data_hash,
         signature: bundle.signature.signature_hex,
       };
       return { record, source: 'arweave' };
@@ -169,7 +160,16 @@
     }
 
     const record = result.record;
-    const payload = { cert_id: record.cert_id, event_id: record.event_id, issued_at: record.issued_at, recipient_name: record.recipient_name };
+    
+    // Payload explicitly includes data_hash matching the backend signing structure
+    const payload = { 
+      cert_id: record.cert_id, 
+      event_id: record.event_id, 
+      issued_at: record.issued_at, 
+      recipient_name: record.recipient_name,
+      data_hash: record.data_hash 
+    };
+
     const msgBytes = new TextEncoder().encode(canonicalize(payload));
     let sigValid = false;
     try {
