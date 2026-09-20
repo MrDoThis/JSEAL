@@ -1,0 +1,6 @@
+fastapi 
+uvicorn 
+pydantic 
+pynacl 
+cryptography 
+arweave-python-client 
