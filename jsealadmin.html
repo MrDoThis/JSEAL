@@ -163,7 +163,7 @@
     </div>
   </section>
 
-  <!-- VERIFY TAB (admin's own copy, for convenience only — see note above) -->
+  <!-- VERIFY TAB -->
   <section id="tabVerify" class="hidden max-w-lg mx-auto bg-white p-6 sm:p-8 rounded-2xl shadow-sm border border-slate-200/80 space-y-6">
     <div class="text-center space-y-2">
       <h2 class="text-xl sm:text-2xl font-bold text-slate-900">Certificate Verification</h2>
@@ -184,32 +184,22 @@
 
 <script>
 const API_URL = "https://jseal-service.onrender.com";
-// The standalone verifier is meant to be deployed on its own, separate from
-// this admin dashboard (different host, different domain even) — that's
-// the whole point of it surviving independently. Point this at wherever
-// verify-standalone.html actually ends up, e.g. "https://verify.yourdomain.com".
-// Left as a relative same-folder path only for local testing convenience.
-const VERIFY_PAGE_URL = "verify-standalone.html";
+const VERIFY_PAGE_URL = "https://mrdothis.github.io/JSEAL/";
 let backendHealthy = false;
 
 let templateImg = new Image();
 let isTemplateLoaded = false;
 let lastSignedRecord = null;
 let lastBatchIssued = [];
-let cachedPublicKeyHex = null;
+let cachedPublicKeyHex = "76903f5ea1d8e4d19d174f0a64fb75cf1fa038021d145dd054cc763471f53f28";
 
-// All three boxes now use a consistent top-left {x,y,w,h} model.
-// (Previously nameBox was center-anchored and qrBox was top-left —
-// that mismatch was part of why resize logic never got wired up
-// consistently across both. certNoBox is new: renders the human-
-// readable certificate ID onto the certificate itself.)
 const layoutState = {
   nameBox:  { x: 0, y: 0, w: 600, h: 90, fontSize: 48 },
   qrBox:    { x: 0, y: 0, w: 130, h: 130 },
   certNoBox:{ x: 0, y: 0, w: 320, h: 46, fontSize: 28 }
 };
 let selectedBoxKey = null;
-let selectedMode = null; // 'move' | 'resize'
+let selectedMode = null; 
 let dragOffset = { x: 0, y: 0 };
 
 async function checkBackendConnection() {
@@ -239,11 +229,15 @@ async function checkBackendConnection() {
 
 async function getPublicKeyHex() {
   if (cachedPublicKeyHex) return cachedPublicKeyHex;
-  const res = await fetch(`${API_URL}/api/v1/trust-root`);
-  if (!res.ok) throw new Error('Could not fetch trust root public key');
-  const data = await res.json();
-  cachedPublicKeyHex = data.public_key_hex;
-  return cachedPublicKeyHex;
+  try {
+    const res = await fetch(`${API_URL}/api/v1/trust-root`);
+    if (!res.ok) throw new Error('Could not fetch trust root public key');
+    const data = await res.json();
+    cachedPublicKeyHex = data.public_key_hex;
+    return cachedPublicKeyHex;
+  } catch (e) {
+    return "76903f5ea1d8e4d19d174f0a64fb75cf1fa038021d145dd054cc763471f53f28";
+  }
 }
 
 function getFittedFontSize(ctx, text, targetWidth, baseFontSize, fontFamily) {
@@ -259,8 +253,6 @@ function getFittedFontSize(ctx, text, targetWidth, baseFontSize, fontFamily) {
   return { size: currentSize, overflowsAtFloor };
 }
 
-// Generic clamp: works identically for all three boxes now that they
-// share the same {x,y,w,h} shape.
 function clampBox(box, canvasW, canvasH, minW, minH) {
   box.w = Math.max(minW, Math.min(box.w, canvasW - 20));
   box.h = Math.max(minH, Math.min(box.h, canvasH - 20));
@@ -282,10 +274,6 @@ function autoFitBoxToTemplate() {
   layoutState.nameBox = { x: w * 0.15, y: h * 0.38, w: w * 0.7, h: Math.round(h * 0.12), fontSize: layoutState.nameBox.fontSize };
   const qrSize = Math.min(140, Math.round(w * 0.12));
   layoutState.qrBox = { x: 40, y: h - qrSize - 110, w: qrSize, h: qrSize };
-  // Sized to be a small, discreet label next to the QR — not a headline
-  // element competing with the recipient's name. Font size is controlled
-  // by the "Certificate Number Font Size" input, not computed here, so it
-  // matches whatever the admin currently has that input set to.
   const certFontSize = parseInt(document.getElementById('certFontSizeInput').value) || 20;
   layoutState.certNoBox = {
     x: 40, y: layoutState.qrBox.y + qrSize + 14,
@@ -358,7 +346,6 @@ function redrawCanvas(highlightKey = null) {
   const certFontSize = parseInt(document.getElementById('certFontSizeInput').value) || 20;
   layoutState.certNoBox.fontSize = certFontSize;
 
-  // --- QR box ---
   const q = layoutState.qrBox;
   ctx.fillStyle = '#ffffff'; ctx.strokeStyle = (highlightKey === 'qrBox') ? '#312e81' : '#4f46e5';
   ctx.lineWidth = highlightKey === 'qrBox' ? 4 : 2;
@@ -368,7 +355,6 @@ function redrawCanvas(highlightKey = null) {
   ctx.fillText('QR', q.x + q.w / 2, q.y + q.h / 2);
   drawHandle(ctx, q, '#4f46e5');
 
-  // --- Name box ---
   const nb = layoutState.nameBox;
   const fittedName = getFittedFontSize(ctx, nameText, nb.w, baseFontSize, fontFamily);
   ctx.font = `bold ${fittedName.size}px ${fontFamily}`;
@@ -380,12 +366,8 @@ function redrawCanvas(highlightKey = null) {
   ctx.strokeRect(nb.x, nb.y, nb.w, nb.h);
   drawHandle(ctx, nb, fittedName.overflowsAtFloor ? '#dc2626' : '#4f46e5');
 
-  // --- Certificate number box (human-readable, printed on the certificate) ---
   const cb = layoutState.certNoBox;
   const certLabel = `No: ${certId}`;
-  // A visible fill behind the text — same idea as the QR box's white
-  // background — so this box is obvious against any template color from
-  // the moment it loads, not just something you find by zooming in.
   ctx.fillStyle = 'rgba(255,255,255,0.85)';
   ctx.fillRect(cb.x, cb.y, cb.w, cb.h);
   const fittedCert = getFittedFontSize(ctx, certLabel, cb.w - 12, cb.fontSize, fontFamily);
@@ -414,9 +396,6 @@ function getCanvasCoordinates(e) {
 }
 
 function boxList() {
-  // Check certNoBox and qrBox before nameBox since nameBox is usually
-  // largest and would otherwise swallow clicks meant for a smaller box
-  // that happens to sit near it.
   return [['certNoBox', layoutState.certNoBox], ['qrBox', layoutState.qrBox], ['nameBox', layoutState.nameBox]];
 }
 function hitResize(box, pos) {
@@ -563,9 +542,6 @@ async function renderCertificateCanvasFor(name, certId, verifyUrl, targetCanvas)
 }
 
 function buildVerifyUrl(certId, arweaveTxId) {
-  // Resolves relative to VERIFY_PAGE_URL, not this page's own location —
-  // so a QR code still points to the right place once the verifier is
-  // deployed on its own separate domain.
   const base = new URL(VERIFY_PAGE_URL, window.location.href);
   base.searchParams.set('verify', certId);
   if (arweaveTxId) base.searchParams.set('ar', arweaveTxId);
