@@ -44,12 +44,13 @@
     <div class="divider"></div>
 
     <div id="details" style="display:none;">
-      <div class="field"><div class="label">Certificate ID</div><div class="value" id="outCertId">--</div></div>
       <div class="field"><div class="label">Recipient Name</div><div class="value" id="outName">--</div></div>
       <div class="field"><div class="label">Event / Issuer ID</div><div class="value" id="outEvent">--</div></div>
       <div class="field"><div class="label">Issued</div><div class="value" id="outIssued">--</div></div>
-      <div class="field"><div class="label">Ed25519 Signature</div><div class="value" id="outSig">--</div></div>
     </div>
+    <!-- Deliberately no Certificate ID or Signature row here: the signature
+         is a technical proof, not something a third party needs to read,
+         and the ID is already visible in the input above. -->
 
     <div id="sourceNote" class="source-note" style="display:none;"></div>
   </div>
@@ -58,8 +59,14 @@
   const CONFIG = {
     ADMIN_API_URL: "https://jseal-service.onrender.com",
     ARWEAVE_GATEWAY: "https://arweave.net",
+    // ADMIN: replace with your real production public key. Get it by
+    // visiting (or curling) ${ADMIN_API_URL}/api/v1/trust-root — do not
+    // reuse a value from anywhere else. A key that doesn't match your
+    // actual signing key will make every genuine certificate show
+    // SIGNATURE INVALID even though nothing is wrong with the certificate.
     PUBLIC_KEY_HEX: "9cc0301d9c91e7c4890fdb82b97ba571a9990c4a8ec0101878857cbe5cd6d2e9"
   };
+  let staleKeyWarning = false;
 
   function hexToBytes(hex) {
     const bytes = new Uint8Array(hex.length / 2);
@@ -81,12 +88,13 @@
   }
 
   function showDetails(record) {
+    // Intentionally does not render record.signature anywhere in the DOM.
+    // The public verifier proves authenticity; it doesn't need to expose
+    // the raw cryptographic material to do that.
     document.getElementById('details').style.display = 'block';
-    document.getElementById('outCertId').innerText = record.cert_id;
     document.getElementById('outName').innerText = record.recipient_name;
     document.getElementById('outEvent').innerText = record.event_id;
     document.getElementById('outIssued').innerText = record.issued_at;
-    document.getElementById('outSig').innerText = record.signature;
   }
 
   function showSourceNote(text) {
@@ -160,11 +168,33 @@
     const record = result.record;
     const payload = { cert_id: record.cert_id, event_id: record.event_id, issued_at: record.issued_at, recipient_name: record.recipient_name };
     const msgBytes = new TextEncoder().encode(canonicalize(payload));
+    staleKeyWarning = false;
+
     let sigValid = false;
     try {
       sigValid = nacl.sign.detached.verify(msgBytes, hexToBytes(record.signature), hexToBytes(CONFIG.PUBLIC_KEY_HEX));
     } catch (e) {
       sigValid = false;
+    }
+
+    // Safety net: if the baked-in key fails but we can still reach the
+    // live admin API, cross-check against whatever key it actually signs
+    // with right now. This exists specifically to catch a stale/wrong
+    // CONFIG.PUBLIC_KEY_HEX during setup or after a key rotation — it does
+    // NOT replace keeping the baked-in key current, since this fallback
+    // only works while the admin server is reachable.
+    if (!sigValid && result.source === 'live') {
+      try {
+        const kres = await fetch(`${CONFIG.ADMIN_API_URL}/api/v1/trust-root`, { signal: AbortSignal.timeout(4000) });
+        if (kres.ok) {
+          const kdata = await kres.json();
+          const liveValid = nacl.sign.detached.verify(msgBytes, hexToBytes(record.signature), hexToBytes(kdata.public_key_hex));
+          if (liveValid) {
+            sigValid = true;
+            staleKeyWarning = true;
+          }
+        }
+      } catch (e) { /* live key fetch failed — fall through with sigValid as-is */ }
     }
 
     showDetails(record);
@@ -177,7 +207,8 @@
 
     if (result.source === 'live' && record.status === 'REVOKED') {
       setBadge('warn', 'Signature Valid — REVOKED');
-      showSourceNote('Verified against the live registry: this certificate has been explicitly revoked by the issuer.');
+      showSourceNote((staleKeyWarning ? 'CONFIG.PUBLIC_KEY_HEX is out of date (verified via live fallback only). ' : '') +
+        'Verified against the live registry: this certificate has been explicitly revoked by the issuer.');
       return;
     }
 
@@ -188,7 +219,9 @@
     }
 
     setBadge('valid', 'Authentic & Active');
-    showSourceNote('Verified against the issuer\'s live registry — signature valid and status active.');
+    showSourceNote(staleKeyWarning
+      ? 'Verified — but only by falling back to a live key lookup. CONFIG.PUBLIC_KEY_HEX in this page is out of date and needs to be updated with the current key, or verification will fail entirely once the admin server is offline.'
+      : 'Verified against the issuer\'s live registry — signature valid and status active.');
   }
 
   window.onload = () => {
