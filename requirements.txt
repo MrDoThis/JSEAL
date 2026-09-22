@@ -1,4 +1,5 @@
 fastapi
-uvicorn[standard]
+uvicorn
+requests
 pynacl
-lighthouseweb3
+python-multipart
