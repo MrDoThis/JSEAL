@@ -349,29 +349,32 @@ async def batch_issue(req: BatchReq):
 # Pre-print blank certificates
 # ============================================================
 
+class PreprintReq(BaseModel):
+    event_id: str
+    cert_prefix: str
+    quantity: int
+
+
 @app.post("/api/v1/certificates/preprint-batch")
-async def preprint_batch(
-    event_id: str,
-    cert_prefix: str,
-    quantity: int,
-):
-    if quantity < 1 or quantity > 1000:
+async def preprint_batch(req: PreprintReq):
+    if req.quantity < 1 or req.quantity > 1000:
         raise HTTPException(400, "quantity must be between 1 and 1000")
 
     certificates = []
     failed = []
 
-    for index in range(quantity):
-        cert_id = f"{cert_prefix.strip()}-{int(time.time())}-{index}"
+    for index in range(req.quantity):
+        cert_id = f"{req.cert_prefix.strip()}-{int(time.time())}-{index}"
 
         try:
             result = await issue_certificate(
                 cert_id=cert_id,
-                event_id=event_id,
+                event_id=req.event_id,
                 recipient_name="",
                 force=False,
             )
             certificates.append(result)
+
         except Exception as exc:
             failed.append({
                 "recipient_name": "",
@@ -380,7 +383,7 @@ async def preprint_batch(
             })
 
     return {
-        "total_requested": quantity,
+        "total_requested": req.quantity,
         "total_issued": len(certificates),
         "total_failed": len(failed),
         "certificates": certificates,
