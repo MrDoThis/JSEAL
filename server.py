@@ -23,22 +23,40 @@ app.add_middleware(
 REGISTRY_FILE = "jseal_registry.json"
 KEY_MANIFEST_FILE = "jseal_key_manifest.json"
 
-# ========== NEW: LIGHTHOUSE PERMANENT STORAGE ==========
-LIGHTHOUSE_API_URL = "https://api.lighthouse.storage/api/v0/add"
+# ========== NEW: HOUSE PERMANENT STORAGE ==========
+LIGHTHOUSE_API_URL = "https://node.lighthouse.storage/api/v0/add"
 
-def get_lighthouse_key():
-    """Get Lighthouse Auth Key from env var LIGHTHOUSE_API_KEY"""
-    return os.getenv("LIGHTHOUSE_API_KEY") or os.getenv("LIGHTHOUSE_AUTH_KEY")
-
-def upload_to_lighthouse(cert_id: str, bundle: dict) -> Optional[str]:
-    """
-    Uploads bundle to Lighthouse IPFS + Filecoin permanently.
-    Returns CID (e.g. Qm...) or None if fails.
-    This is PERMANENT - even if Render dies, IPFS gateway will serve it.
-    """
-    api_key = get_lighthouse_key()
+def upload_to_lighthouse(cert_data: dict, cert_id: str) -> str | None:
+    """Upload to Lighthouse IPFS + Filecoin - FIXED URL"""
+    api_key = os.getenv("LIGHTHOUSE_API_KEY") or os.getenv("LIGHTHOUSE_AUTH_KEY")
     if not api_key:
-        print("[Lighthouse] No LIGHTHOUSE_API_KEY set - skipping permanent archival, but signing still works")
+        print("[Lighthouse] No key")
+        return None
+
+    try:
+        # Lighthouse expects file upload
+        json_bytes = json.dumps(cert_data).encode('utf-8')
+        files = {'file': (f'{cert_id}.json', json_bytes, 'application/json')}
+
+        # FIXED HEADERS - Lighthouse uses Bearer token
+        headers = {
+            'Authorization': f'Bearer {api_key.strip()}'
+        }
+
+        resp = requests.post(LIGHTHOUSE_API_URL, files=files, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # CID is in Hash
+        cid = data.get('Hash') or data.get('cid')
+        if cid:
+            print(f"[Lighthouse] SUCCESS {cert_id} -> CID: {cid}")
+            return cid
+        print(f"[Lighthouse] No CID in response: {data}")
+        return None
+
+    except Exception as e:
+        print(f"[Lighthouse] Upload failed for {cert_id}: {e}")
         return None
 
     try:
