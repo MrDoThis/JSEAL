@@ -1,134 +1,170 @@
-import os, json, uuid, hashlib, requests
-from datetime import datetime, timezone
-from typing import Optional, List, Dict
+import os, hashlib, json, time
+from datetime import datetime
+from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import nacl.signing, nacl.encoding
+import nacl.signing
+import nacl.encoding
+import httpx
 
-app = FastAPI(title="JSeal Permanent Free")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+# --- CONFIG ---
+JSEAL_SIGNING_KEY = os.getenv("JSEAL_SIGNING_KEY", "").strip()
+PINATA_JWT = os.getenv("PINATA_JWT", "").strip()
 
-DB_PATH = os.getenv("JSEAL_DB_PATH","certificates_db.json")
-def _load_db():
-    if os.path.exists(DB_PATH):
-        try:
-            with open(DB_PATH,"r") as f: return json.load(f)
-        except: return {}
-    return {}
-def _save_db():
+if not JSEAL_SIGNING_KEY:
+    raise RuntimeError("JSEAL_SIGNING_KEY not set - set it to a7b00f86d595f134f7b76b049955631b50eaa46fced4963b9c22cfea61a6d1a1")
+
+signing_key = nacl.signing.SigningKey(JSEAL_SIGNING_KEY.encode(), encoder=nacl.encoding.HexEncoder)
+verify_key = signing_key.verify_key
+PUBLIC_HEX = verify_key.encode(encoder=nacl.encoding.HexEncoder).decode()
+
+print(f"[JSeal] Public key: {PUBLIC_HEX}")
+print(f"[JSeal] Pinata configured: {bool(PINATA_JWT)}")
+
+app = FastAPI(title="JSeal Permanent")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Simple in-memory store - replace with DB later if you want
+DB = {}
+
+def canonical(payload: dict) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(',',':'))
+
+def sign_payload(payload: dict):
+    msg = canonical(payload).encode()
+    sig = signing_key.sign(msg).signature
+    data_hash = hashlib.sha256(msg).hexdigest()
+    return sig.hex(), data_hash
+
+async def pin_to_ipfs(cert_id: str, bundle: dict):
+    if not PINATA_JWT:
+        return None
     try:
-        with open(DB_PATH,"w") as f: json.dump(certificates_db,f,indent=2)
-    except: pass
-certificates_db=_load_db()
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://api.pinata.cloud/pinning/pinJSONToIPFS",
+                headers={"Authorization": f"Bearer {PINATA_JWT}", "Content-Type": "application/json"},
+                json={"pinataContent": bundle, "pinataMetadata": {"name": f"{cert_id}.json"}}
+            )
+            r.raise_for_status()
+            cid = r.json()["IpfsHash"]
+            return cid
+    except Exception as e:
+        print(f"[Pinata] Failed {cert_id}: {e}")
+        return None
 
-# --- LOCK YOUR KEY ---
-_signing_key=None
-def _load_key():
-    global _signing_key
-    env=os.getenv("JSEAL_SIGNING_KEY")
-    if env:
-        try:
-            _signing_key=nacl.signing.SigningKey(bytes.fromhex(env.strip()[:64]))
-            print("[JSeal] Key from JSEAL_SIGNING_KEY env")
-            return
-        except: pass
-    if os.path.exists("signing_key.hex"):
-        try:
-            with open("signing_key.hex","r") as f:
-                _signing_key=nacl.signing.SigningKey(bytes.fromhex(f.read().strip()[:64]))
-            print("[JSeal] Key from file")
-            return
-        except: pass
-    _signing_key=nacl.signing.SigningKey.generate()
-    try:
-        with open("signing_key.hex","w") as f: f.write(_signing_key.encode(encoder=nacl.encoding.HexEncoder).decode())
-    except: pass
-    priv=_signing_key.encode(encoder=nacl.encoding.HexEncoder).decode()
-    pub=_signing_key.verify_key.encode(encoder=nacl.encoding.HexEncoder).decode()
-    print(f"*** NEW KEY - SAVE TO RENDER ENV JSEAL_SIGNING_KEY={priv} *** PUB={pub}")
+# --- MODELS ---
+class IssueReq(BaseModel):
+    cert_id: str
+    event_id: str
+    recipient_name: str
+    force: bool = False
 
-_load_key()
-def get_pub(): return _signing_key.verify_key.encode(encoder=nacl.encoding.HexEncoder).decode()
-def canon(p): return json.dumps(p,sort_keys=True,separators=(",",":"))
-def sign_payload(payload):
-    msg=canon(payload).encode()
-    return hashlib.sha256(msg).hexdigest(), _signing_key.sign(msg).signature.hex()
+class BatchReq(BaseModel):
+    event_id: str
+    cert_prefix: str = "CERT"
+    records: List[dict] # [{recipient_name, cert_id?}]
+    force: bool = False
 
-# --- PERMANENT FREE STORAGE - NO PAYMENT ---
-# You just need free Pinata JWT: pinata.cloud -> Sign up free -> API Keys -> New Key -> Copy JWT
-PINATA_JWT=os.getenv("PINATA_JWT","") # Free 1GB forever
+class AssignReq(BaseModel):
+    recipient_name: str
 
-def upload_permanent(bundle: dict, cert_id: str) -> tuple[Optional[str], Optional[str]]:
-    """
-    Returns (ipfs_cid, permanent_url) - free forever, no $12/mo
-    """
-    data=json.dumps(bundle).encode()
-
-    # 1) Pinata free (1GB free forever)
-    if PINATA_JWT:
-        try:
-            r=requests.post("https://api.pinata.cloud/pinning/pinFileToIPFS",
-                headers={"Authorization": f"Bearer {PINATA_JWT}"},
-                files={"file": (f"{cert_id}.json", data, "application/json")},
-                data={"pinataMetadata": json.dumps({"name": f"{cert_id}.json"})},
-                timeout=30)
-            print(f"[Pinata] {r.status_code}")
-            if r.status_code in (200,201):
-                cid=r.json().get("IpfsHash")
-                url=f"https://gateway.pinata.cloud/ipfs/{cid}"
-                print(f"[Pinata] SUCCESS {cert_id} -> {url}")
-                return cid, url
-            else:
-                print(f"[Pinata] failed: {r.text[:400]}")
-        except Exception as e:
-            print(f"[Pinata] error: {e}")
-
-    # 2) Fallback: public IPFS (works without key, but slower)
-    try:
-        # Try nft.storage free endpoint (storacha)
-        r=requests.post("https://api.web3.storage/upload",
-            headers={"Content-Type":"application/json"},
-            data=data, timeout=30)
-        if r.status_code in (200,201):
-            cid=r.json().get("cid")
-            if cid:
-                print(f"[web3.storage] SUCCESS {cert_id} -> https://w3s.link/ipfs/{cid}")
-                return cid, f"https://w3s.link/ipfs/{cid}"
-    except: pass
-
-    print(f"[{cert_id}] No PINATA_JWT set, saved locally only. Set PINATA_JWT env to get permanent IPFS link.")
-    return None, None
-
-def build_bundle(cid,payload,dh,sig): return {"jseal_version":"1.0","certificate_id":cid,"payload":payload,"hash":{"algorithm":"SHA-256","digest_hex":dh},"signature":{"algorithm":"Ed25519","signature_hex":sig}}
-
-def _issue(cert_id,event_id,recipient):
-    issued=datetime.now(timezone.utc).isoformat()
-    payload={"cert_id":cert_id,"event_id":event_id,"issued_at":issued,"recipient_name":recipient}
-    dh,sig=sign_payload(payload)
-    bundle=build_bundle(cert_id,payload,dh,sig)
-    ipfs_cid, perm_url = upload_permanent(bundle,cert_id)
-    certificates_db[cert_id]={"cert_id":cert_id,"event_id":event_id,"recipient_name":recipient,"issued_at":issued,"status":"ACTIVE","data_hash":dh,"signature":sig,"ipfs_cid":ipfs_cid,"permanent_url":perm_url,"bundle":bundle}
-    _save_db()
-    return payload,dh,sig,ipfs_cid,perm_url
-
-class IssueRequest(BaseModel): cert_id:str; event_id:str; recipient_name:str; force:bool=False
-class BatchRecord(BaseModel): recipient_name:str; cert_id:Optional[str]=None
-class BatchIssueRequest(BaseModel): event_id:str; cert_prefix:str="cert"; records:List[BatchRecord]; force:bool=False
-
-@app.get("/")
-def root(): return {"status":"JSeal free permanent live","public_key":get_pub(),"total":len(certificates_db)}
+# --- ROUTES ---
 @app.get("/health")
-def health(): return {"status":"ok","public_key":get_pub(),"total":len(certificates_db),"pinata_configured": bool(PINATA_JWT)}
+def health():
+    return {
+        "status": "ok",
+        "signing_key_available": True,
+        "public_key_hex": PUBLIC_HEX,
+        "pinata": bool(PINATA_JWT)
+    }
+
 @app.get("/api/v1/trust-root")
-def trust(): return {"issuer":"JSEAL","algorithm":"Ed25519","public_key_hex":get_pub()}
+def trust_root():
+    return {"public_key_hex": PUBLIC_HEX, "algorithm": "Ed25519"}
+
 @app.post("/api/v1/certificates/issue")
-def issue(req:IssueRequest):
-    if certificates_db.get(req.cert_id) and not req.force: raise HTTPException(409,"exists")
-    p,dh,sig,cid,url=_issue(req.cert_id,req.event_id,req.recipient_name)
-    return {"cert_id":req.cert_id,"payload":p,"data_hash":dh,"signature":sig,"ipfs_cid":cid,"permanent_url":url}
+async def issue(req: IssueReq):
+    if req.cert_id in DB and not req.force:
+        raise HTTPException(400, f"{req.cert_id} already exists - use force=true to overwrite")
+
+    payload = {
+        "cert_id": req.cert_id,
+        "event_id": req.event_id,
+        "recipient_name": req.recipient_name,
+        "issued_at": datetime.utcnow().isoformat() + "Z"
+    }
+    sig_hex, data_hash = sign_payload(payload)
+
+    bundle = {
+        "jseal_version": "1.0",
+        "certificate_id": req.cert_id,
+        "payload": payload,
+        "hash": {"algorithm": "SHA-256", "digest_hex": data_hash},
+        "signature": {"algorithm": "Ed25519", "signature_hex": sig_hex}
+    }
+
+    cid = await pin_to_ipfs(req.cert_id, bundle)
+    bundle["ipfs_cid"] = cid
+    bundle["permanent_url"] = f"https://gateway.pinata.cloud/ipfs/{cid}" if cid else None
+    bundle["arweave_tx_id"] = cid # keep frontend compat - it uses this field for verify url
+
+    DB[req.cert_id] = {**payload, "signature": sig_hex, "data_hash": data_hash, "ipfs_cid": cid, "status": "ACTIVE"}
+
+    return {
+        "cert_id": req.cert_id,
+        "payload": payload,
+        "data_hash": data_hash,
+        "signature": sig_hex,
+        "arweave_tx_id": cid,
+        "ipfs_cid": cid,
+        "permanent_url": bundle["permanent_url"]
+    }
+
 @app.get("/api/v1/certificates/verify/{cert_id}")
-def verify(cert_id:str):
-    r=certificates_db.get(cert_id)
-    if not r: return {"found":False}
-    return {"found":True,**r}
+def verify(cert_id: str):
+    rec = DB.get(cert_id)
+    if not rec:
+        return {"found": False, "cert_id": cert_id}
+    return {"found": True, **rec}
+
+@app.get("/api/v1/certificates/pending")
+def pending():
+    return [v for v in DB.values() if not v.get("recipient_name")]
+
+@app.post("/api/v1/certificates/batch-issue")
+async def batch_issue(req: BatchReq):
+    certs = []
+    failed = []
+    for i, r in enumerate(req.records):
+        name = r.get("recipient_name","").strip()
+        cid = r.get("cert_id") or f"{req.cert_prefix}-{int(time.time())}-{i}"
+        if not name:
+            failed.append({"recipient_name": name, "cert_id": cid, "reason": "missing name"})
+            continue
+        try:
+            res = await issue(IssueReq(cert_id=cid, event_id=req.event_id, recipient_name=name, force=req.force))
+            certs.append(res)
+        except Exception as e:
+            failed.append({"recipient_name": name, "cert_id": cid, "reason": str(e)})
+    return {"total_requested": len(req.records), "total_issued": len(certs), "total_failed": len(failed), "certificates": certs, "failed": failed}
+
+# --- minimal assign routes for your preprint flow ---
+@app.post("/api/v1/certificates/preprint-batch")
+async def preprint_batch(event_id: str, cert_prefix: str, quantity: int):
+    # body as json
+    return await batch_issue(BatchReq(event_id=event_id, cert_prefix=cert_prefix, records=[{"recipient_name": ""} for _ in range(quantity)]))
+
+@app.post("/api/v1/certificates/{cert_id}/assign")
+async def assign(cert_id: str, body: AssignReq):
+    rec = DB.get(cert_id)
+    if not rec:
+        raise HTTPException(404, "not found")
+    rec["recipient_name"] = body.recipient_name
+    # re-sign
+    payload = {"cert_id": rec["cert_id"], "event_id": rec["event_id"], "recipient_name": body.recipient_name, "issued_at": rec["issued_at"]}
+    sig, h = sign_payload(payload)
+    rec["signature"] = sig
+    rec["data_hash"] = h
+    return {"payload": payload, "data_hash": h, "signature": sig, "arweave_tx_id": rec.get("ipfs_cid")}
