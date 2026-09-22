@@ -33,7 +33,7 @@
   <div class="container">
     <div id="statusBadge" class="badge checking">Checking...</div>
     <h1>Certificate Verification</h1>
-    <p class="subtitle">Verified against permanent storage (IPFS + Filecoin via Lighthouse). Works forever even if issuer site is down.</p>
+    <p class="subtitle">Verified against the JSeal certificate registry and permanent IPFS storage.</p>
 
     <div id="lookupForm">
       <input type="text" id="certIdInput" placeholder="Certificate ID or CID (Qm...)">
@@ -46,7 +46,7 @@
       <div class="field"><div class="label">Recipient Name</div><div class="value" id="outName">--</div></div>
       <div class="field"><div class="label">Event / Issuer ID</div><div class="value" id="outEvent">--</div></div>
       <div class="field"><div class="label">Issued</div><div class="value" id="outIssued">--</div></div>
-      <div class="field"><div class="label">Permanent CID</div><div class="value" id="outCid">--</div></div>
+
     </div>
 
     <div id="sourceNote" class="source-note" style="display:none;"></div>
@@ -80,7 +80,7 @@
     document.getElementById('outName').innerText = record.recipient_name;
     document.getElementById('outEvent').innerText = record.event_id;
     document.getElementById('outIssued').innerText = record.issued_at;
-    document.getElementById('outCid').innerText = cid || record.lighthouse_cid || record.arweave_tx_id || '--';
+
   }
   function showSourceNote(text) {
     const el = document.getElementById('sourceNote');
@@ -117,7 +117,7 @@
           event_id: bundle.payload.event_id,
           issued_at: bundle.payload.issued_at,
           signature: bundle.signature.signature_hex,
-          lighthouse_cid: bundle.lighthouse_cid || cid,
+          lighthouse_cid: bundle.ipfs_cid || bundle.lighthouse_cid || cid,
         };
         return { record, source: 'lighthouse', cid };
       } catch { continue; }
@@ -228,12 +228,12 @@
 
     if (result.source === 'arweave') {
       setBadge('valid', 'Signature Valid (Arweave Archive)');
-      showSourceNote('Verified against Arweave permanent archive.');
+      showSourceNote('Verified from permanent archive. The certificate record and cryptographic signature were checked successfully.');
       return;
     }
 
     setBadge('valid', 'Authentic & Active');
-    showSourceNote(`Verified against live registry. Permanent backup: ${result.cid? CONFIG.LIGHTHOUSE_GATEWAY + '/' + result.cid : 'pending'}`);
+    showSourceNote('Verified against the live certificate registry.');
   }
 
   window.onload = () => {
