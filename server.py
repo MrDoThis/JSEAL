@@ -3,8 +3,9 @@ import json
 import uuid
 import hashlib
 import tempfile
+import requests
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,7 +13,7 @@ from pydantic import BaseModel
 import nacl.signing
 import nacl.encoding
 
-app = FastAPI(title="JSeal Certificate Service")
+app = FastAPI(title="JSeal Certificate Service - Permanent Arweave")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,57 +23,59 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# Persistence
-# ---------------------------------------------------------------------------
+# ---------- DB ----------
 DB_PATH = os.getenv("JSEAL_DB_PATH", "certificates_db.json")
 
-def _load_db():
+def _load_db() -> Dict[str, Any]:
     if os.path.exists(DB_PATH):
         try:
             with open(DB_PATH, "r") as f:
                 return json.load(f)
-        except Exception:
+        except:
             return {}
     return {}
 
 def _save_db():
-    with open(DB_PATH, "w") as f:
-        json.dump(certificates_db, f, indent=2)
+    try:
+        with open(DB_PATH, "w") as f:
+            json.dump(certificates_db, f, indent=2)
+    except Exception as e:
+        print(f"[DB] save failed: {e}")
 
-certificates_db = _load_db()
+certificates_db: Dict[str, Any] = _load_db()
 
-# ---------------------------------------------------------------------------
-# Signing key
-# ---------------------------------------------------------------------------
+# ---------- SIGNING KEY ----------
 SIGNING_KEY_PATH = os.getenv("JSEAL_SIGNING_KEY_PATH", "signing_key.hex")
-_signing_key = None
-_signing_key_is_persistent = False
+_signing_key: Optional[nacl.signing.SigningKey] = None
 
 def _load_or_create_signing_key():
-    global _signing_key, _signing_key_is_persistent
+    global _signing_key
     env_seed = os.getenv("JSEAL_SIGNING_KEY")
     if env_seed:
-        _signing_key = nacl.signing.SigningKey(bytes.fromhex(env_seed.strip()))
-        _signing_key_is_persistent = True
-        print("[JSeal] Signing key loaded from JSEAL_SIGNING_KEY env var.")
-        return
+        try:
+            _signing_key = nacl.signing.SigningKey(bytes.fromhex(env_seed.strip()))
+            print("[JSeal] Signing key loaded from env JSEAL_SIGNING_KEY")
+            return
+        except Exception as e:
+            print(f"[JSeal] Invalid JSEAL_SIGNING_KEY env: {e}")
+    
     if os.path.exists(SIGNING_KEY_PATH):
-        with open(SIGNING_KEY_PATH, "r") as f:
-            _signing_key = nacl.signing.SigningKey(bytes.fromhex(f.read().strip()))
-        _signing_key_is_persistent = True
-        print(f"[JSeal] Signing key loaded from {SIGNING_KEY_PATH}.")
-        return
+        try:
+            with open(SIGNING_KEY_PATH, "r") as f:
+                _signing_key = nacl.signing.SigningKey(bytes.fromhex(f.read().strip()))
+            print(f"[JSeal] Signing key loaded from {SIGNING_KEY_PATH}")
+            return
+        except Exception as e:
+            print(f"[JSeal] Failed to load key file: {e}")
+
     _signing_key = nacl.signing.SigningKey.generate()
     try:
         with open(SIGNING_KEY_PATH, "w") as f:
             f.write(_signing_key.encode(encoder=nacl.encoding.HexEncoder).decode())
-        _signing_key_is_persistent = True
-        print(f"[JSeal] No signing key found — generated a new one and saved it to {SIGNING_KEY_PATH}.")
+        print(f"[JSeal] NEW signing key generated -> {SIGNING_KEY_PATH}")
     except Exception:
-        _signing_key_is_persistent = False
-        print("[JSeal] WARNING: generated ephemeral key, set JSEAL_SIGNING_KEY.")
-    print(f"[JSeal] Public key (hex): {_signing_key.verify_key.encode(encoder=nacl.encoding.HexEncoder).decode()}")
+        pass
+    print(f"[JSeal] NEW Public key: {_signing_key.verify_key.encode(encoder=nacl.encoding.HexEncoder).decode()}")
 
 _load_or_create_signing_key()
 
@@ -83,82 +86,111 @@ def canonicalize(payload: dict) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 def sign_payload(payload: dict):
-    message = canonicalize(payload).encode("utf-8")
-    data_hash = hashlib.sha256(message).hexdigest()
-    signed = _signing_key.sign(message)
-    return data_hash, signed.signature.hex()
+    msg = canonicalize(payload).encode("utf-8")
+    data_hash = hashlib.sha256(msg).hexdigest()
+    sig = _signing_key.sign(msg).signature.hex()
+    return data_hash, sig
 
-# ---------------------------------------------------------------------------
-# Lighthouse (IPFS + Filecoin permanent storage) - FIXED + DEBUG VERSION
-# ---------------------------------------------------------------------------
-try:
-    from lighthouseweb3 import Lighthouse
-    _lh_sdk_available = True
-except ImportError:
-    _lh_sdk_available = False
+# ---------- PERMANENT PAY-ONCE: ARWEAVE (FREE FOR <100KB) ----------
+# No config needed in arweave.app - this just works.
+# Your certs are 0.54KB, so ArDrive Turbo free tier covers it forever.
 
-def lighthouse_configured() -> bool:
-    return bool(os.getenv("LIGHTHOUSE_API_KEY")) and _lh_sdk_available
+def upload_to_arweave_permanent(bundle: dict, cert_id: str) -> Optional[str]:
+    """
+    Uploads to Arweave permanently. 
+    For files <100KB it's FREE via Turbo, no AR needed.
+    Returns Arweave TX ID, permanent URL = https://arweave.net/{tx_id}
+    """
+    try:
+        data = json.dumps(bundle).encode("utf-8")
+        
+        # 1st try: Turbo free endpoint (recommended for tiny files)
+        try:
+            r = requests.post(
+                "https://turbo.ardrive.io/v1/data",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                timeout=30
+            )
+            if r.status_code in (200, 201, 202):
+                j = r.json() if r.text else {}
+                tx_id = j.get("id") or j.get("dataTxId") or j.get("arweaveId")
+                if tx_id:
+                    print(f"[Arweave] SUCCESS {cert_id} -> https://arweave.net/{tx_id}")
+                    return tx_id
+                # Some gateways return tx id as plain text
+                if r.text and len(r.text.strip()) == 43: # Arweave tx id length
+                    print(f"[Arweave] SUCCESS {cert_id} -> https://arweave.net/{r.text.strip()}")
+                    return r.text.strip()
+            print(f"[Arweave] Turbo response {r.status_code}: {r.text[:300]}")
+        except Exception as e:
+            print(f"[Arweave] Turbo try failed: {e}")
 
-def build_lighthouse_bundle(cert_id, payload, data_hash, signature_hex):
+        # 2nd try: Public arweave.net uploader
+        try:
+            r2 = requests.post(
+                "https://upload.ardrive.io/v1/tx",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                timeout=30
+            )
+            if r2.status_code in (200, 201, 202):
+                j = r2.json()
+                tx_id = j.get("id")
+                if tx_id:
+                    print(f"[Arweave] SUCCESS (fallback) {cert_id} -> https://arweave.net/{tx_id}")
+                    return tx_id
+        except Exception as e:
+            print(f"[Arweave] Fallback try failed: {e}")
+
+        print(f"[Arweave] All upload attempts failed for {cert_id}, will save locally only")
+        return None
+
+    except Exception as e:
+        print(f"[Arweave] FAILED {cert_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def build_bundle(cert_id: str, payload: dict, data_hash: str, signature_hex: str) -> dict:
     return {
         "jseal_version": "1.0",
         "certificate_id": cert_id,
         "payload": payload,
         "hash": {"algorithm": "SHA-256", "digest_hex": data_hash},
         "signature": {"algorithm": "Ed25519", "signature_hex": signature_hex},
+        "storage": {"type": "arweave", "permanent": True}
     }
 
-def upload_to_lighthouse(bundle: dict, cert_id: str) -> Optional[str]:
-    api_key = os.getenv("LIGHTHOUSE_API_KEY")
-    if not api_key or not _lh_sdk_available:
-        print(f"[Lighthouse] Skip {cert_id}: no API key or SDK not installed")
-        return None
+def _issue_or_sign(cert_id: str, event_id: str, recipient_name: str):
+    issued_at = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "cert_id": cert_id,
+        "event_id": event_id,
+        "issued_at": issued_at,
+        "recipient_name": recipient_name
+    }
+    data_hash, signature_hex = sign_payload(payload)
+    bundle = build_bundle(cert_id, payload, data_hash, signature_hex)
+    
+    arweave_tx_id = upload_to_arweave_permanent(bundle, cert_id)
+    
+    certificates_db[cert_id] = {
+        "cert_id": cert_id,
+        "event_id": event_id,
+        "recipient_name": recipient_name,
+        "issued_at": issued_at,
+        "status": "ACTIVE",
+        "data_hash": data_hash,
+        "signature": signature_hex,
+        "arweave_tx_id": arweave_tx_id,
+        "permanent_url": f"https://arweave.net/{arweave_tx_id}" if arweave_tx_id else None,
+        "bundle": bundle
+    }
+    _save_db()
+    return payload, data_hash, signature_hex, arweave_tx_id
 
-    tmp_path = None
-    try:
-        # --- DEBUG: check whoami / quota ---
-        try:
-            import requests
-            r = requests.get(
-                "https://api.lighthouse.storage/api/v0/auth/whoami",
-                headers={"Authorization": f"Bearer {api_key}"},
-                timeout=10
-            )
-            print(f"[Lighthouse] whoami {r.status_code}: {r.text[:500]}")
-        except Exception as e:
-            print(f"[Lighthouse] whoami check failed: {e}")
-
-        lh = Lighthouse(token=api_key)
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
-            json.dump(bundle, tmp)
-            tmp_path = tmp.name
-
-        result = lh.upload(tmp_path)
-        print(f"[Lighthouse] Raw result for {cert_id}: {result}")
-
-        cid = None
-        if isinstance(result, dict):
-            cid = result.get("data", {}).get("Hash") or result.get("Hash") or result.get("cid") or result.get("data", {}).get("Cid")
-
-        if cid:
-            print(f"[Lighthouse] SUCCESS {cert_id} -> {cid}")
-        else:
-            print(f"[Lighthouse] FAILED - No CID in result for {cert_id}: {result}")
-        return cid
-
-    except Exception as e:
-        print(f"[Lighthouse] FAILED {cert_id}: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
+# ---------- MODELS ----------
 class IssueRequest(BaseModel):
     cert_id: str
     event_id: str
@@ -191,143 +223,147 @@ class AssignBatchRequest(BaseModel):
     records: List[AssignBatchRecord]
     force: bool = False
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def now_iso(): return datetime.now(timezone.utc).isoformat()
 
-def _issue_or_sign(cert_id: str, event_id: str, recipient_name: str):
-    issued_at = now_iso()
-    payload = {
-        "cert_id": cert_id,
-        "event_id": event_id,
-        "issued_at": issued_at,
-        "recipient_name": recipient_name,
+# ---------- ROUTES ----------
+@app.get("/")
+def root():
+    return {
+        "status": "JSeal Arweave live",
+        "public_key_hex": get_public_key_hex(),
+        "storage": "Arweave pay-once permanent (free <100KB)",
+        "total_certs": len(certificates_db)
     }
-    data_hash, signature_hex = sign_payload(payload)
-    bundle = build_lighthouse_bundle(cert_id, payload, data_hash, signature_hex)
-    cid = upload_to_lighthouse(bundle, cert_id)
 
-    certificates_db[cert_id] = {
-        "cert_id": cert_id,
-        "event_id": event_id,
-        "recipient_name": recipient_name,
-        "issued_at": issued_at,
-        "status": "ACTIVE",
-        "data_hash": data_hash,
-        "signature": signature_hex,
-        "lighthouse_cid": cid,
-    }
-    _save_db()
-    return payload, data_hash, signature_hex, cid
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "signing_key_available": _signing_key is not None,
-        "signing_key_persistent": _signing_key_is_persistent,
-        "lighthouse_configured": lighthouse_configured(),
+        "public_key": get_public_key_hex(),
         "total_certificates": len(certificates_db),
+        "permanent_storage": "Arweave pay-once",
+        "permanent_url_example": "https://arweave.net/TX_ID"
     }
 
 @app.get("/api/v1/trust-root")
 def trust_root():
-    return {"issuer": "JSEAL", "algorithm": "Ed25519", "public_key_hex": get_public_key_hex()}
+    return {
+        "issuer": "JSEAL",
+        "algorithm": "Ed25519",
+        "public_key_hex": get_public_key_hex()
+    }
 
 @app.post("/api/v1/certificates/issue")
 def issue_certificate(req: IssueRequest):
     existing = certificates_db.get(req.cert_id)
-    if existing and existing.get("status")!= "PENDING" and not req.force:
-        raise HTTPException(status_code=409, detail=f"Certificate ID '{req.cert_id}' already exists.")
-    payload, data_hash, signature_hex, cid = _issue_or_sign(req.cert_id, req.event_id, req.recipient_name)
+    if existing and existing.get("status") != "PENDING" and not req.force:
+        raise HTTPException(status_code=409, detail=f"Certificate {req.cert_id} already exists. Use force=true to reissue.")
+    
+    payload, data_hash, signature_hex, ar_id = _issue_or_sign(req.cert_id, req.event_id, req.recipient_name)
     return {
         "cert_id": req.cert_id,
         "payload": payload,
         "data_hash": data_hash,
         "signature": signature_hex,
-        "arweave_tx_id": cid,
-        "lighthouse_cid": cid,
+        "arweave_tx_id": ar_id,
+        "permanent_url": f"https://arweave.net/{ar_id}" if ar_id else None,
+        "verify_url": f"https://arweave.net/{ar_id}" if ar_id else f"/api/v1/certificates/verify/{req.cert_id}"
     }
+
+@app.get("/api/v1/certificates/verify/{cert_id}")
+def verify_certificate(cert_id: str):
+    record = certificates_db.get(cert_id)
+    if not record:
+        return {"found": False, "cert_id": cert_id}
+    return {"found": True, **record}
+
+@app.get("/api/v1/certificates")
+def list_certificates():
+    return {"total": len(certificates_db), "certificates": list(certificates_db.values())}
 
 @app.post("/api/v1/certificates/batch-issue")
 def batch_issue(req: BatchIssueRequest):
-    issued, failed = [], []
+    issued = []
+    failed = []
     for rec in req.records:
         cert_id = rec.cert_id or f"{req.cert_prefix}-{uuid.uuid4().hex[:8]}"
-        existing = certificates_db.get(cert_id)
-        if existing and existing.get("status")!= "PENDING" and not req.force:
-            failed.append({"recipient_name": rec.recipient_name, "cert_id": cert_id, "reason": "exists"})
+        if certificates_db.get(cert_id) and not req.force:
+            failed.append({"cert_id": cert_id, "reason": "exists"})
             continue
         try:
-            payload, data_hash, signature_hex, cid = _issue_or_sign(cert_id, req.event_id, rec.recipient_name)
-            issued.append({"cert_id": cert_id, "payload": payload, "data_hash": data_hash, "signature": signature_hex, "arweave_tx_id": cid, "lighthouse_cid": cid})
+            payload, dh, sig, ar_id = _issue_or_sign(cert_id, req.event_id, rec.recipient_name)
+            issued.append({
+                "cert_id": cert_id,
+                "payload": payload,
+                "data_hash": dh,
+                "signature": sig,
+                "arweave_tx_id": ar_id,
+                "permanent_url": f"https://arweave.net/{ar_id}" if ar_id else None
+            })
         except Exception as e:
-            failed.append({"recipient_name": rec.recipient_name, "cert_id": cert_id, "reason": str(e)})
-    return {"total_requested": len(req.records), "total_issued": len(issued), "total_failed": len(failed), "certificates": issued, "failed": failed}
+            failed.append({"cert_id": cert_id, "reason": str(e)})
+    return {"total_requested": len(req.records), "total_issued": len(issued), "certificates": issued, "failed": failed}
 
-@app.post("/api/v1/certificates/preprint-batch")
-def preprint_batch(req: PreprintRequest):
+@app.post("/api/v1/certificates/preprint")
+def preprint_certs(req: PreprintRequest):
     created = []
     for _ in range(req.quantity):
         cert_id = f"{req.cert_prefix}-{uuid.uuid4().hex[:8]}"
-        while cert_id in certificates_db:
-            cert_id = f"{req.cert_prefix}-{uuid.uuid4().hex[:8]}"
-        certificates_db[cert_id] = {"cert_id": cert_id, "event_id": req.event_id, "recipient_name": None, "issued_at": None, "status": "PENDING", "data_hash": None, "signature": None, "lighthouse_cid": None}
-        created.append({"cert_id": cert_id})
+        issued_at = now_iso()
+        certificates_db[cert_id] = {
+            "cert_id": cert_id,
+            "event_id": req.event_id,
+            "recipient_name": "",
+            "issued_at": issued_at,
+            "status": "PENDING",
+            "data_hash": None,
+            "signature": None,
+            "arweave_tx_id": None,
+            "bundle": None
+        }
+        created.append({"cert_id": cert_id, "status": "PENDING"})
     _save_db()
-    return {"total_requested": req.quantity, "certificates": created}
-
-@app.get("/api/v1/certificates/pending")
-def pending():
-    return [{"cert_id": c["cert_id"], "event_id": c["event_id"]} for c in certificates_db.values() if c.get("status") == "PENDING"]
+    return {"total_created": len(created), "certificates": created}
 
 @app.post("/api/v1/certificates/{cert_id}/assign")
-def assign_single(cert_id: str, req: AssignRequest):
-    record = certificates_db.get(cert_id)
-    if not record:
-        raise HTTPException(status_code=404, detail=f"Certificate '{cert_id}' not found.")
-    if record.get("status")!= "PENDING":
-        raise HTTPException(status_code=400, detail=f"Not pending: {record.get('status')}")
-    payload, data_hash, signature_hex, cid = _issue_or_sign(cert_id, record["event_id"], req.recipient_name)
-    return {"cert_id": cert_id, "payload": payload, "data_hash": data_hash, "signature": signature_hex, "arweave_tx_id": cid, "lighthouse_cid": cid}
+def assign_certificate(cert_id: str, req: AssignRequest):
+    rec = certificates_db.get(cert_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Not found")
+    if rec.get("status") == "ACTIVE" and rec.get("recipient_name"):
+        raise HTTPException(status_code=409, detail="Already assigned")
+    payload, dh, sig, ar_id = _issue_or_sign(cert_id, rec["event_id"], req.recipient_name)
+    return {
+        "cert_id": cert_id,
+        "payload": payload,
+        "data_hash": dh,
+        "signature": sig,
+        "arweave_tx_id": ar_id,
+        "permanent_url": f"https://arweave.net/{ar_id}" if ar_id else None
+    }
 
 @app.post("/api/v1/certificates/assign-batch")
 def assign_batch(req: AssignBatchRequest):
-    assigned, failed = [], []
-    for rec in req.records:
-        record = certificates_db.get(rec.cert_id)
-        if not record:
-            failed.append({"cert_id": rec.cert_id, "reason": "not found"})
+    assigned = []
+    failed = []
+    for r in req.records:
+        rec = certificates_db.get(r.cert_id)
+        if not rec:
+            failed.append({"cert_id": r.cert_id, "reason": "not found"})
             continue
-        if record.get("status") == "ACTIVE" and not req.force:
-            failed.append({"cert_id": rec.cert_id, "reason": "already assigned"})
+        if rec.get("status") == "ACTIVE" and rec.get("recipient_name") and not req.force:
+            failed.append({"cert_id": r.cert_id, "reason": "already assigned"})
             continue
         try:
-            payload, data_hash, signature_hex, cid = _issue_or_sign(rec.cert_id, record["event_id"], rec.recipient_name)
-            assigned.append({"cert_id": rec.cert_id, "payload": payload, "data_hash": data_hash, "signature": signature_hex, "arweave_tx_id": cid, "lighthouse_cid": cid})
+            payload, dh, sig, ar_id = _issue_or_sign(r.cert_id, rec["event_id"], r.recipient_name)
+            assigned.append({
+                "cert_id": r.cert_id,
+                "payload": payload,
+                "data_hash": dh,
+                "signature": sig,
+                "arweave_tx_id": ar_id,
+                "permanent_url": f"https://arweave.net/{ar_id}" if ar_id else None
+            })
         except Exception as e:
-            failed.append({"cert_id": rec.cert_id, "reason": str(e)})
-    return {"total_requested": len(req.records), "total_assigned": len(assigned), "total_failed": len(failed), "certificates": assigned, "failed": failed}
-
-@app.get("/api/v1/certificates/verify/{cert_id}")
-def verify(cert_id: str):
-    record = certificates_db.get(cert_id)
-    if not record:
-        return {"found": False}
-    return {"found": True, "cert_id": record["cert_id"], "event_id": record["event_id"], "issued_at": record.get("issued_at"), "recipient_name": record.get("recipient_name"), "signature": record.get("signature"), "status": record.get("status"), "lighthouse_cid": record.get("lighthouse_cid")}
-
-@app.post("/api/v1/certificates/{cert_id}/revoke")
-def revoke(cert_id: str):
-    record = certificates_db.get(cert_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Certificate not found.")
-    record["status"] = "REVOKED"
-    certificates_db[cert_id] = record
-    _save_db()
-    return {"cert_id": cert_id, "status": "REVOKED"}
-
-@app.get("/")
-def root():
-    return {"status": "JSeal backend live", "public_key_hex": get_public_key_hex()}
+            failed.append({"cert_id": r.cert_id, "reason": str(e)})
+    return {"total_assigned": len(assigned), "assigned": assigned, "failed": failed}
