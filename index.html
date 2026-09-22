@@ -3,27 +3,26 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>JSeal Certificate Verification</title>
+<title>JSeal Certificate Verification - PERMANENT</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/tweetnacl/1.0.2/nacl-fast.min.js"></script>
 <style>
   :root { --bg:#0f172a; --card:#1e293b; --text:#f8fafc; --muted:#94a3b8; --ok:#10b981; --err:#ef4444; --warn:#f59e0b; --border:#334155; }
   body { font-family: system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--text); margin:0; padding:16px;
          display:flex; justify-content:center; align-items:flex-start; min-height:100vh; box-sizing:border-box; }
-  .container { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:24px; width:100%; max-width:480px;
+ .container { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:24px; width:100%; max-width:480px;
                box-shadow:0 10px 25px rgba(0,0,0,0.4); margin-top:24px; }
   h1 { font-size:1.25rem; margin:0 0 4px 0; }
-  .subtitle { color:var(--muted); font-size:.85rem; margin:0 0 20px 0; }
-  .badge { display:inline-block; padding:6px 12px; border-radius:20px; font-size:.8rem; font-weight:700; margin-bottom:16px;
-           text-transform:uppercase; letter-spacing:.04em; }
-  .badge.checking { background:#334155; color:#cbd5e1; }
-  .badge.valid { background:rgba(16,185,129,.15); color:var(--ok); border:1px solid var(--ok); }
-  .badge.warn  { background:rgba(245,158,11,.15); color:var(--warn); border:1px solid var(--warn); }
-  .badge.invalid { background:rgba(239,68,68,.15); color:var(--err); border:1px solid var(--err); }
-  .field { margin-bottom:12px; }
-  .label { font-size:.7rem; color:var(--muted); text-transform:uppercase; letter-spacing:.03em; }
-  .value { font-size:.9rem; font-weight:500; word-break:break-all; margin-top:2px; }
-  .divider { height:1px; background:var(--border); margin:18px 0; }
-  .source-note { font-size:.75rem; color:var(--muted); background:#0f172a; border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin-top:16px; }
+ .subtitle { color:var(--muted); font-size:.85rem; margin:0 0 20px 0; }
+ .badge { display:inline-block; padding:6px 12px; border-radius:20px; font-size:.8rem; font-weight:700; margin-bottom:16px; text-transform:uppercase; letter-spacing:.04em; }
+ .badge.checking { background:#334155; color:#cbd5e1; }
+ .badge.valid { background:rgba(16,185,129,.15); color:var(--ok); border:1px solid var(--ok); }
+ .badge.warn { background:rgba(245,158,11,.15); color:var(--warn); border:1px solid var(--warn); }
+ .badge.invalid { background:rgba(239,68,68,.15); color:var(--err); border:1px solid var(--err); }
+ .field { margin-bottom:12px; }
+ .label { font-size:.7rem; color:var(--muted); text-transform:uppercase; letter-spacing:.03em; }
+ .value { font-size:.9rem; font-weight:500; word-break:break-all; margin-top:2px; }
+ .divider { height:1px; background:var(--border); margin:18px 0; }
+ .source-note { font-size:.75rem; color:var(--muted); background:#0f172a; border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin-top:16px; }
   input[type=text] { width:100%; box-sizing:border-box; padding:10px 12px; border-radius:8px; border:1px solid var(--border);
                      background:#0f172a; color:var(--text); font-size:.9rem; margin-bottom:10px; }
   button { width:100%; padding:10px; border-radius:8px; border:none; background:#4f46e5; color:#fff; font-weight:600; cursor:pointer; font-size:.9rem; }
@@ -34,10 +33,10 @@
   <div class="container">
     <div id="statusBadge" class="badge checking">Checking...</div>
     <h1>Certificate Verification</h1>
-    <p class="subtitle">This certificate is verified against the issuer’s official records and permanent archive. The verification confirms the certificate’s authenticity, details, and current status.</p>
+    <p class="subtitle">Verified against permanent storage (IPFS + Filecoin via Lighthouse). Works forever even if issuer site is down.</p>
 
     <div id="lookupForm">
-      <input type="text" id="certIdInput" placeholder="Certificate ID, e.g. CERT-2026-001">
+      <input type="text" id="certIdInput" placeholder="Certificate ID or CID (Qm...)">
       <button onclick="runVerification()">Verify</button>
     </div>
 
@@ -47,6 +46,7 @@
       <div class="field"><div class="label">Recipient Name</div><div class="value" id="outName">--</div></div>
       <div class="field"><div class="label">Event / Issuer ID</div><div class="value" id="outEvent">--</div></div>
       <div class="field"><div class="label">Issued</div><div class="value" id="outIssued">--</div></div>
+      <div class="field"><div class="label">Permanent CID</div><div class="value" id="outCid">--</div></div>
     </div>
 
     <div id="sourceNote" class="source-note" style="display:none;"></div>
@@ -55,36 +55,33 @@
 <script>
   const CONFIG = {
     ADMIN_API_URL: "https://jseal-service.onrender.com",
+    LIGHTHOUSE_GATEWAY: "https://gateway.lighthouse.storage/ipfs",
     ARWEAVE_GATEWAY: "https://arweave.net",
     PUBLIC_KEY_HEX: "76903f5ea1d8e4d19d174f0a64fb75cf1fa038021d145dd054cc763471f53f28"
   };
-  let staleKeyWarning = false;
 
   function hexToBytes(hex) {
     const bytes = new Uint8Array(hex.length / 2);
     for (let i = 0; i < hex.length; i += 2) bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
     return bytes;
   }
-
   function canonicalize(payload) {
     const sorted = {};
     Object.keys(payload).sort().forEach(k => sorted[k] = payload[k]);
     return JSON.stringify(sorted, null, 0);
   }
-
   function setBadge(cls, text) {
     const b = document.getElementById('statusBadge');
     b.className = "badge " + cls;
     b.innerText = text;
   }
-
-  function showDetails(record) {
+  function showDetails(record, cid) {
     document.getElementById('details').style.display = 'block';
     document.getElementById('outName').innerText = record.recipient_name;
     document.getElementById('outEvent').innerText = record.event_id;
     document.getElementById('outIssued').innerText = record.issued_at;
+    document.getElementById('outCid').innerText = cid || record.lighthouse_cid || record.arweave_tx_id || '--';
   }
-
   function showSourceNote(text) {
     const el = document.getElementById('sourceNote');
     el.style.display = 'block';
@@ -98,10 +95,34 @@
       if (!res.ok) return null;
       const data = await res.json();
       if (!data.found) return { notFoundLive: true };
-      return { record: data, source: 'live' };
-    } catch (err) {
-      return null; 
+      return { record: data, source: 'live', cid: data.lighthouse_cid || data.arweave_tx_id };
+    } catch { return null; }
+  }
+
+  async function tryLighthouse(cid) {
+    if (!cid) return null;
+    const gateways = [
+      `${CONFIG.LIGHTHOUSE_GATEWAY}/${cid}`,
+      `https://ipfs.io/ipfs/${cid}`,
+      `https://dweb.link/ipfs/${cid}`
+    ];
+    for (const url of gateways) {
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+        if (!res.ok) continue;
+        const bundle = await res.json();
+        const record = {
+          cert_id: bundle.certificate_id,
+          recipient_name: bundle.payload.recipient_name,
+          event_id: bundle.payload.event_id,
+          issued_at: bundle.payload.issued_at,
+          signature: bundle.signature.signature_hex,
+          lighthouse_cid: bundle.lighthouse_cid || cid,
+        };
+        return { record, source: 'lighthouse', cid };
+      } catch { continue; }
     }
+    return null;
   }
 
   async function tryArweave(txId) {
@@ -117,102 +138,110 @@
         issued_at: bundle.payload.issued_at,
         signature: bundle.signature.signature_hex,
       };
-      return { record, source: 'arweave' };
-    } catch (err) {
-      return null;
-    }
+      return { record, source: 'arweave', cid: txId };
+    } catch { return null; }
   }
 
   async function runVerification() {
-    const certId = document.getElementById('certIdInput').value.trim();
+    const input = document.getElementById('certIdInput').value.trim();
     const urlParams = new URLSearchParams(window.location.search);
+    const cidParam = urlParams.get('cid');
     const arTxId = urlParams.get('ar');
+    const verifyParam = urlParams.get('verify') || input;
 
     document.getElementById('details').style.display = 'none';
     document.getElementById('sourceNote').style.display = 'none';
-    setBadge('checking', 'Verifying...');
+    setBadge('checking', 'Verifying from permanent storage...');
 
-    if (!certId) { setBadge('invalid', 'Enter a certificate ID'); return; }
-    if (!CONFIG.PUBLIC_KEY_HEX) {
-      setBadge('invalid', 'Verifier misconfigured');
-      showSourceNote('This deployment has not had a public key configured yet.');
-      return;
-    }
+    if (!verifyParam &&!cidParam) { setBadge('invalid', 'Enter a certificate ID or CID'); return; }
 
-    let result = await tryLiveRegistry(certId);
-    if (result && result.notFoundLive) {
-      result = await tryArweave(arTxId);
+    let result = null;
+
+    // 1. If CID is directly provided (NEW PERMANENT FLOW), use it first - truly permanent
+    if (cidParam) {
+      result = await tryLighthouse(cidParam);
     }
-    if (!result) {
-      result = await tryArweave(arTxId);
+    // If input itself looks like CID
+    if (!result && verifyParam && (verifyParam.startsWith('Qm') || verifyParam.startsWith('bafy'))) {
+      result = await tryLighthouse(verifyParam);
     }
+    // 2. Try live registry
+    if (!result && verifyParam) {
+      result = await tryLiveRegistry(verifyParam);
+      if (result && result.notFoundLive) result = null;
+    }
+    // 3. If live has CID, try lighthouse via that CID
+    if (!result && verifyParam) {
+      const live = await tryLiveRegistry(verifyParam);
+      if (live && live.cid) {
+        result = await tryLighthouse(live.cid) || await tryArweave(live.cid);
+      }
+    }
+    // 4. Fallback to old Arweave param
+    if (!result) result = await tryArweave(arTxId);
+    if (!result && cidParam) result = await tryArweave(cidParam);
 
     if (!result) {
       setBadge('invalid', 'Not Found / Unreachable');
-      showSourceNote('Could not reach the live registry, and no permanent Arweave archive reference was available for this ID.');
+      showSourceNote('Could not find certificate in live registry or permanent storage. If this is a new certificate, make sure QR contains?cid=Qm...');
       return;
     }
 
     const record = result.record;
     const payload = { cert_id: record.cert_id, event_id: record.event_id, issued_at: record.issued_at, recipient_name: record.recipient_name };
     const msgBytes = new TextEncoder().encode(canonicalize(payload));
-    staleKeyWarning = false;
 
     let sigValid = false;
     try {
       sigValid = nacl.sign.detached.verify(msgBytes, hexToBytes(record.signature), hexToBytes(CONFIG.PUBLIC_KEY_HEX));
-    } catch (e) {
-      sigValid = false;
-    }
+    } catch { sigValid = false; }
 
     if (!sigValid && result.source === 'live') {
       try {
         const kres = await fetch(`${CONFIG.ADMIN_API_URL}/api/v1/trust-root`, { signal: AbortSignal.timeout(4000) });
         if (kres.ok) {
           const kdata = await kres.json();
-          const liveValid = nacl.sign.detached.verify(msgBytes, hexToBytes(record.signature), hexToBytes(kdata.public_key_hex));
-          if (liveValid) {
-            sigValid = true;
-            staleKeyWarning = true;
-          }
+          sigValid = nacl.sign.detached.verify(msgBytes, hexToBytes(record.signature), hexToBytes(kdata.public_key_hex));
         }
-      } catch (e) { /* live key fetch failed */ }
+      } catch {}
     }
 
-    showDetails(record);
+    showDetails(record, result.cid);
 
     if (!sigValid) {
       setBadge('invalid', 'SIGNATURE INVALID');
-      showSourceNote('The data does not match its own signature. Do not trust this record — it may have been tampered with.');
+      showSourceNote('Data does not match signature. Do not trust.');
       return;
     }
 
     if (result.source === 'live' && record.status === 'REVOKED') {
       setBadge('warn', 'Signature Valid — REVOKED');
-      showSourceNote((staleKeyWarning ? 'CONFIG.PUBLIC_KEY_HEX is out of date (verified via live fallback only). ' : '') +
-        'Verified against the live registry: this certificate has been explicitly revoked by the issuer.');
+      showSourceNote('Verified against live registry: REVOKED by issuer.');
+      return;
+    }
+
+    if (result.source === 'lighthouse') {
+      setBadge('valid', 'Authentic & Permanent ✓');
+      showSourceNote(`Verified from PERMANENT storage (IPFS + Filecoin). CID: ${result.cid}\nGateway: https://gateway.lighthouse.storage/ipfs/${result.cid}\nThis will be verifiable forever, even if the issuer's website disappears.`);
       return;
     }
 
     if (result.source === 'arweave') {
-      setBadge('valid', 'Signature Valid (Archive)');
-      showSourceNote('Verified against the permanent Arweave archive because the issuer\'s live registry was unreachable.');
+      setBadge('valid', 'Signature Valid (Arweave Archive)');
+      showSourceNote('Verified against Arweave permanent archive.');
       return;
     }
 
     setBadge('valid', 'Authentic & Active');
-    showSourceNote(staleKeyWarning
-      ? 'Verified — but only by falling back to a live key lookup. CONFIG.PUBLIC_KEY_HEX in this page is out of date and needs to be updated with the current key.'
-      : 'Verified against the issuer\'s live registry — signature valid and status active.');
+    showSourceNote(`Verified against live registry. Permanent backup: ${result.cid? CONFIG.LIGHTHOUSE_GATEWAY + '/' + result.cid : 'pending'}`);
   }
 
   window.onload = () => {
     const urlParams = new URLSearchParams(window.location.search);
     const verifyParam = urlParams.get('verify');
-    if (verifyParam) {
-      document.getElementById('certIdInput').value = verifyParam;
-      runVerification();
-    }
+    const cidParam = urlParams.get('cid');
+    if (verifyParam) document.getElementById('certIdInput').value = verifyParam;
+    if (cidParam || verifyParam) runVerification();
   };
 </script>
 </body>
