@@ -668,13 +668,12 @@ async function renderCertificateCanvasFor(name, certId, verifyUrl, targetCanvas,
   return { fittedCert };
 }
 
-function buildVerifyUrl(certId, arweaveTxId) {
-  // Resolves relative to VERIFY_PAGE_URL, not this page's own location —
-  // so a QR code still points to the right place once the verifier is
-  // deployed on its own separate domain.
+function buildVerifyUrl(certId, lighthouseCid) {
   const base = new URL(VERIFY_PAGE_URL, window.location.href);
   base.searchParams.set('verify', certId);
-  if (arweaveTxId) base.searchParams.set('ar', arweaveTxId);
+  if (lighthouseCid) {
+    base.searchParams.set('cid', lighthouseCid); // Permanent IPFS CID
+  }
   return base.toString();
 }
 
