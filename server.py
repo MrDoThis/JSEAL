@@ -69,7 +69,27 @@ class SigningError(Exception):
         self.status_code = status_code
 
 
-def sign_payload(cert_id: str, event_id: str, recipient_name: str, force: bool = False) -> dict:
+PENDING_NAME_PLACEHOLDER = "PENDING_ASSIGNMENT"
+
+
+def _next_index_for_prefix(prefix: str) -> int:
+    """Scans the registry for existing IDs like '{prefix}-###' and returns
+    the next free number. Without this, two separate batches (or a batch
+    run twice) with the same prefix would both try to start at -001 and
+    collide — this makes numbering continue where it left off instead."""
+    registry = load_registry()
+    max_idx = 0
+    needle = prefix + "-"
+    for cid in registry.keys():
+        if cid.startswith(needle):
+            suffix = cid[len(needle):]
+            if suffix.isdigit():
+                max_idx = max(max_idx, int(suffix))
+    return max_idx + 1
+
+
+def sign_payload(cert_id: str, event_id: str, recipient_name: str, force: bool = False,
+                  status: str = "ACTIVE", archive: bool = True) -> dict:
     cert_id = (cert_id or "").strip()
     recipient_name = (recipient_name or "").strip()
     event_id = (event_id or "").strip()
@@ -116,19 +136,23 @@ def sign_payload(cert_id: str, event_id: str, recipient_name: str, force: bool =
     data_hash = hashlib.sha256(payload_bytes).hexdigest()
     signature_hex = signing_key.sign(payload_bytes).signature.hex()
 
-    # Optional permanent archival (architecture Phase 2). Disabled unless
-    # ARWEAVE_ENABLED + ARWEAVE_WALLET_PATH are configured — see
-    # arweave_client.py. A failure or timeout here never blocks issuance;
-    # arweave_tx_id just stays null and the certificate is still fully
-    # valid via the live registry.
-    bundle = {
-        "jseal_version": "1.0",
-        "certificate_id": cert_id,
-        "payload": payload,
-        "hash": {"algorithm": "SHA-256", "digest_hex": data_hash},
-        "signature": {"algorithm": "Ed25519", "signature_hex": signature_hex},
-    }
-    arweave_tx_id = arweave_client.upload_bundle(cert_id, bundle)
+    # Optional permanent archival (architecture Phase 2). Skipped entirely
+    # for pending/blank pre-prints — archiving a placeholder name would
+    # leave a permanent, immutable "PENDING_ASSIGNMENT" copy on Arweave
+    # even after a real name is assigned later. Only the finalized content
+    # (from /issue or /assign) gets archived. Disabled unless
+    # ARWEAVE_ENABLED + ARWEAVE_WALLET_PATH are configured; a failure or
+    # timeout here never blocks issuance.
+    arweave_tx_id = None
+    if archive:
+        bundle = {
+            "jseal_version": "1.0",
+            "certificate_id": cert_id,
+            "payload": payload,
+            "hash": {"algorithm": "SHA-256", "digest_hex": data_hash},
+            "signature": {"algorithm": "Ed25519", "signature_hex": signature_hex},
+        }
+        arweave_tx_id = arweave_client.upload_bundle(cert_id, bundle)
 
     registry[cert_id] = {
         "cert_id": cert_id,
@@ -137,7 +161,7 @@ def sign_payload(cert_id: str, event_id: str, recipient_name: str, force: bool =
         "issued_at": issued_at,
         "data_hash": data_hash,
         "signature": signature_hex,
-        "status": "ACTIVE",
+        "status": status,
         "arweave_tx_id": arweave_tx_id,
     }
     save_registry(registry)
@@ -164,6 +188,27 @@ class BatchIssueRequest(BaseModel):
     event_id: str
     cert_prefix: str = "CERT"
     records: List[BatchRecord]
+    force: bool = False
+
+
+class PreprintBatchRequest(BaseModel):
+    event_id: str
+    cert_prefix: str = "CERT"
+    quantity: int
+
+
+class AssignRequest(BaseModel):
+    recipient_name: str
+    force: bool = False
+
+
+class AssignBatchRecord(BaseModel):
+    cert_id: str
+    recipient_name: str
+
+
+class AssignBatchRequest(BaseModel):
+    records: List[AssignBatchRecord]
     force: bool = False
 
 
@@ -194,9 +239,14 @@ def batch_issue_certificates(req: BatchIssueRequest):
 
     issued, failed = [], []
     seen_ids_this_batch = set()
+    next_auto_idx = _next_index_for_prefix(req.cert_prefix)
 
     for i, rec in enumerate(req.records, start=1):
-        cert_id = (rec.cert_id or "").strip() or f"{req.cert_prefix}-{i:03d}"
+        if rec.cert_id and rec.cert_id.strip():
+            cert_id = rec.cert_id.strip()
+        else:
+            cert_id = f"{req.cert_prefix}-{next_auto_idx:03d}"
+            next_auto_idx += 1
 
         if cert_id in seen_ids_this_batch:
             failed.append({"row": i, "cert_id": cert_id, "recipient_name": rec.recipient_name,
@@ -219,6 +269,116 @@ def batch_issue_certificates(req: BatchIssueRequest):
         "certificates": issued,
         "failed": failed,
     }
+
+
+@app.post("/api/v1/certificates/preprint-batch")
+def preprint_batch(req: PreprintBatchRequest):
+    """Generates blank, already-signed certificates ahead of time — cert
+    number and QR are real and valid immediately, but the recipient name is
+    a placeholder until someone assigns a real name later via /assign or
+    /assign-batch. The certificate ID never changes between pre-print and
+    assignment, so a QR code printed now stays correct forever."""
+    if req.quantity < 1 or req.quantity > 1000:
+        raise HTTPException(status_code=400, detail="quantity must be between 1 and 1000.")
+
+    created = []
+    next_idx = _next_index_for_prefix(req.cert_prefix)
+    for _ in range(req.quantity):
+        cert_id = f"{req.cert_prefix}-{next_idx:03d}"
+        next_idx += 1
+        try:
+            signed = sign_payload(cert_id, req.event_id, PENDING_NAME_PLACEHOLDER,
+                                   status="PENDING_ASSIGNMENT", archive=False)
+            created.append({"cert_id": cert_id, "payload": signed["payload"]})
+        except SigningError as e:
+            # Extremely unlikely (would mean a collision even after
+            # scanning the registry), but don't let one bad row kill the
+            # rest of the batch.
+            created.append({"cert_id": cert_id, "error": str(e)})
+
+    return {"total_requested": req.quantity, "certificates": created}
+
+
+@app.post("/api/v1/certificates/{cert_id}/assign")
+def assign_certificate(cert_id: str, req: AssignRequest):
+    """Attaches a real recipient name to a certificate ID — whether that ID
+    was pre-printed blank, or already active and needs correcting. Re-signs
+    with the real name and archives the FINAL content to Arweave (pending
+    placeholders are never archived — see sign_payload). The certificate ID
+    itself never changes, so any QR code already printed for this ID keeps
+    working without modification."""
+    registry = load_registry()
+    existing = registry.get(cert_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Certificate ID '{cert_id}' not found.")
+    if existing.get("status") == "REVOKED" and not req.force:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Certificate '{cert_id}' is REVOKED. Assigning a new name would silently "
+                    "un-revoke it — pass force=true if that's really intended.",
+        )
+
+    try:
+        signed = sign_payload(cert_id, existing["event_id"], req.recipient_name,
+                               force=True, status="ACTIVE", archive=True)
+    except SigningError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
+
+    return {"cert_id": cert_id, "payload": signed["payload"], "data_hash": signed["data_hash"],
+            "signature": signed["signature"], "arweave_tx_id": signed.get("arweave_tx_id")}
+
+
+@app.post("/api/v1/certificates/assign-batch")
+def assign_batch(req: AssignBatchRequest):
+    """Bulk version of /assign — for uploading a CSV/XLSX of CertificateID,
+    Name pairs once names are known. Every row is attempted even if some
+    fail (unknown ID, revoked without force), and every outcome is reported
+    individually rather than aborting the whole batch."""
+    if not req.records:
+        raise HTTPException(status_code=400, detail="records must contain at least one entry.")
+
+    registry = load_registry()
+    assigned, failed = [], []
+
+    for i, rec in enumerate(req.records, start=1):
+        cert_id = (rec.cert_id or "").strip()
+        existing = registry.get(cert_id)
+        if not existing:
+            failed.append({"row": i, "cert_id": cert_id, "recipient_name": rec.recipient_name,
+                            "reason": f"Certificate ID '{cert_id}' not found."})
+            continue
+        if existing.get("status") == "REVOKED" and not req.force:
+            failed.append({"row": i, "cert_id": cert_id, "recipient_name": rec.recipient_name,
+                            "reason": "Certificate is REVOKED — use force to un-revoke and reassign."})
+            continue
+        try:
+            signed = sign_payload(cert_id, existing["event_id"], rec.recipient_name,
+                                   force=True, status="ACTIVE", archive=True)
+            assigned.append({"cert_id": cert_id, "payload": signed["payload"],
+                              "data_hash": signed["data_hash"], "signature": signed["signature"],
+                              "arweave_tx_id": signed.get("arweave_tx_id")})
+            registry = load_registry()  # refresh so subsequent rows see updated state
+        except SigningError as e:
+            failed.append({"row": i, "cert_id": cert_id, "recipient_name": rec.recipient_name, "reason": str(e)})
+
+    return {
+        "total_requested": len(req.records),
+        "total_assigned": len(assigned),
+        "total_failed": len(failed),
+        "certificates": assigned,
+        "failed": failed,
+    }
+
+
+@app.get("/api/v1/certificates/pending")
+def list_pending_certificates():
+    """Lists blank, pre-printed certificate IDs still waiting for a name —
+    what the admin UI's assignment dropdown is populated from."""
+    registry = load_registry()
+    return [
+        {"cert_id": r["cert_id"], "event_id": r["event_id"], "issued_at": r["issued_at"]}
+        for r in registry.values() if r.get("status") == "PENDING_ASSIGNMENT"
+    ]
 
 
 @app.get("/api/v1/certificates/verify/{cert_id}")
