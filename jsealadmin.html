@@ -691,7 +691,7 @@ function buildSignedBundle(record) {
 
 async function downloadSigned(format) {
   if (!lastSignedRecord) return;
-  const verifyUrl = buildVerifyUrl(lastSignedRecord.cert_id, lastSignedRecord.arweave_tx_id);
+  const verifyUrl = buildVerifyUrl(lastSignedRecord.cert_id, lastSignedRecord.lighthouse_cid || lastSignedRecord.arweave_tx_id);
 
   if (format === 'json') {
     const bundle = buildSignedBundle(lastSignedRecord);
