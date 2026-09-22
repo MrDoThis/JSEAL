@@ -1,6 +1,5 @@
-fastapi 
-uvicorn 
-pydantic 
-pynacl 
-cryptography 
-arweave-python-client 
+fastapi
+uvicorn
+python-multipart
+pynacl
+requests
