@@ -39,7 +39,7 @@
     Checking backend connection...
   </div>
   <div class="w-full py-2 px-4 rounded-xl text-center text-xs bg-indigo-50 border border-indigo-200 text-indigo-800">
-    Note: this admin Studio is separate from the public Verify page. Third parties verifying a certificate should use the standalone verifier, not this dashboard — see <code>verify-standalone.html</code>.
+    Admin verification shows registry, signature, hash and permanent-storage details. The standalone verifier intentionally shows only the public verification result.
   </div>
 
   <!-- GENERATOR TAB -->
@@ -619,8 +619,8 @@ async function signSingleCertificate() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || `Server returned ${res.status}`);
 
-    lastSignedRecord = { cert_id: certId, event_id: eventId, recipient_name: name, payload: data.payload, data_hash: data.data_hash, signature: data.signature, arweave_tx_id: data.arweave_tx_id || null };
-    statusEl.innerHTML = `<span class="text-emerald-600">Signed successfully. Hash: ${data.data_hash.slice(0, 16)}...${data.arweave_tx_id ? ' · Archived to Arweave.' : ''}</span>`;
+    lastSignedRecord = { cert_id: certId, event_id: eventId, recipient_name: name, payload: data.payload, data_hash: data.data_hash, signature: data.signature, ipfs_cid: data.ipfs_cid || null };
+    statusEl.innerHTML = `<span class="text-emerald-600">Signed successfully. Hash: ${data.data_hash.slice(0, 16)}...${data.ipfs_cid ? ' · Archived to Arweave.' : ''}</span>`;
     setDownloadButtonsEnabled(true);
   } catch (err) {
     statusEl.innerHTML = `<span class="text-red-600">${err.message}</span>`;
@@ -684,14 +684,14 @@ function buildSignedBundle(record) {
     payload: record.payload,
     hash: { algorithm: "SHA-256", digest_hex: record.data_hash },
     signature: { algorithm: "Ed25519", signature_hex: record.signature },
-    arweave_tx_id: record.arweave_tx_id || null,
-    verify_url: buildVerifyUrl(record.cert_id, record.arweave_tx_id)
+    ipfs_cid: record.ipfs_cid || null,
+    verify_url: buildVerifyUrl(record.cert_id, record.ipfs_cid)
   };
 }
 
 async function downloadSigned(format) {
   if (!lastSignedRecord) return;
-  const verifyUrl = buildVerifyUrl(lastSignedRecord.cert_id, lastSignedRecord.lighthouse_cid || lastSignedRecord.arweave_tx_id);
+  const verifyUrl = buildVerifyUrl(lastSignedRecord.cert_id, lastSignedRecord.ipfs_cid || lastSignedRecord.ipfs_cid);
 
   if (format === 'json') {
     const bundle = buildSignedBundle(lastSignedRecord);
@@ -798,12 +798,12 @@ async function downloadAllAsZip() {
   for (let i = 0; i < lastBatchIssued.length; i++) {
     const cert = lastBatchIssued[i];
     btn.innerText = `Rendering ${i + 1} of ${lastBatchIssued.length}...`;
-    const verifyUrl = buildVerifyUrl(cert.cert_id, cert.arweave_tx_id);
+    const verifyUrl = buildVerifyUrl(cert.cert_id, cert.ipfs_cid);
     const tempCanvas = document.createElement('canvas');
     await renderCertificateCanvasFor(cert.payload.recipient_name, cert.cert_id, verifyUrl, tempCanvas);
     const blob = await new Promise(r => tempCanvas.toBlob(r, 'image/png'));
     zip.file(`${cert.cert_id}.png`, blob);
-    zip.file(`${cert.cert_id}.json`, JSON.stringify(buildSignedBundle({ cert_id: cert.cert_id, payload: cert.payload, data_hash: cert.data_hash, signature: cert.signature, arweave_tx_id: cert.arweave_tx_id }), null, 2));
+    zip.file(`${cert.cert_id}.json`, JSON.stringify(buildSignedBundle({ cert_id: cert.cert_id, payload: cert.payload, data_hash: cert.data_hash, signature: cert.signature, ipfs_cid: cert.ipfs_cid }), null, 2));
   }
   btn.innerText = "Zipping...";
   const zipBlob = await zip.generateAsync({ type: 'blob' });
@@ -937,7 +937,7 @@ async function assignSingleName() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || `Server returned ${res.status}`);
 
-    lastAssignedRecord = { cert_id: certId, payload: data.payload, data_hash: data.data_hash, signature: data.signature, arweave_tx_id: data.arweave_tx_id };
+    lastAssignedRecord = { cert_id: certId, payload: data.payload, data_hash: data.data_hash, signature: data.signature, ipfs_cid: data.ipfs_cid };
     statusEl.innerHTML = `<span class="text-emerald-600">Assigned "${name}" to ${certId}. Same certificate number and QR as before.</span>`;
     document.getElementById('assignSingleDownloads').classList.remove('hidden');
     document.getElementById('assignName').value = '';
@@ -949,7 +949,7 @@ async function assignSingleName() {
 
 async function downloadLastAssigned(format) {
   if (!lastAssignedRecord) return;
-  const verifyUrl = buildVerifyUrl(lastAssignedRecord.cert_id, lastAssignedRecord.arweave_tx_id);
+  const verifyUrl = buildVerifyUrl(lastAssignedRecord.cert_id, lastAssignedRecord.ipfs_cid);
   const tempCanvas = document.createElement('canvas');
   await renderCertificateCanvasFor(lastAssignedRecord.payload.recipient_name, lastAssignedRecord.cert_id, verifyUrl, tempCanvas);
   if (format === 'png') {
@@ -1056,7 +1056,7 @@ async function downloadAssignedAsZip() {
   for (let i = 0; i < lastAssignedBatch.length; i++) {
     const cert = lastAssignedBatch[i];
     btn.innerText = `Rendering ${i + 1} of ${lastAssignedBatch.length}...`;
-    const verifyUrl = buildVerifyUrl(cert.cert_id, cert.arweave_tx_id);
+    const verifyUrl = buildVerifyUrl(cert.cert_id, cert.ipfs_cid);
     const tempCanvas = document.createElement('canvas');
     await renderCertificateCanvasFor(cert.payload.recipient_name, cert.cert_id, verifyUrl, tempCanvas);
     const blob = await new Promise(r => tempCanvas.toBlob(r, 'image/png'));
@@ -1081,12 +1081,22 @@ function canonicalize(payload) {
   return JSON.stringify(sorted);
 }
 
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 async function verifyCertificate() {
   const certId = document.getElementById('verifyInput').value.trim();
   const resultDiv = document.getElementById('verifyResult');
+
   resultDiv.classList.remove('hidden');
   resultDiv.className = "p-4 rounded-xl border text-sm bg-slate-50 border-slate-200 text-slate-600";
-  resultDiv.innerText = "Checking registry and signature...";
+  resultDiv.innerText = "Checking registry and cryptographic signature...";
 
   if (!certId) {
     resultDiv.className = "p-4 rounded-xl border text-sm bg-amber-50 border-amber-200 text-amber-800";
@@ -1095,34 +1105,82 @@ async function verifyCertificate() {
   }
 
   try {
-    const res = await fetch(`${API_URL}/api/v1/certificates/verify/${encodeURIComponent(certId)}`);
-    const record = await res.json();
+    const res = await fetch(
+      `${API_URL}/api/v1/certificates/verify/${encodeURIComponent(certId)}`
+    );
+    const data = await res.json();
 
-    if (!record.found) {
+    if (!res.ok) {
+      throw new Error(data.detail || `Server returned ${res.status}`);
+    }
+
+    if (!data.found) {
       resultDiv.className = "p-4 rounded-xl border text-sm bg-red-50 border-red-200 text-red-800";
       resultDiv.innerText = "NOT FOUND — no certificate with this ID exists in the registry.";
       return;
     }
 
     const pubKeyHex = await getPublicKeyHex();
-    const payload = { cert_id: record.cert_id, event_id: record.event_id, issued_at: record.issued_at, recipient_name: record.recipient_name };
-    const msgBytes = new TextEncoder().encode(canonicalize(payload));
-    const sigValid = nacl.sign.detached.verify(msgBytes, hexToBytes(record.signature), hexToBytes(pubKeyHex));
+    const payload = {
+      cert_id: data.cert_id,
+      event_id: data.event_id,
+      issued_at: data.issued_at,
+      recipient_name: data.recipient_name
+    };
 
-    if (!sigValid) {
-      resultDiv.className = "p-4 rounded-xl border text-sm bg-red-50 border-red-200 text-red-900 space-y-1";
-      resultDiv.innerHTML = `<strong>SIGNATURE INVALID — DO NOT TRUST</strong><br>The registry record for ${record.cert_id} does not match its own signature.`;
+    const message = new TextEncoder().encode(canonicalize(payload));
+    const signatureValid = nacl.sign.detached.verify(
+      message,
+      hexToBytes(data.signature),
+      hexToBytes(pubKeyHex)
+    );
+
+    if (!signatureValid) {
+      resultDiv.className = "p-4 rounded-xl border text-sm bg-red-50 border-red-200 text-red-900";
+      resultDiv.innerHTML = `
+        <strong>SIGNATURE INVALID — DO NOT TRUST</strong>
+        <div class="mt-2 text-xs">The registry record does not match its Ed25519 signature.</div>
+      `;
       return;
     }
 
-    if (record.status === 'REVOKED') {
-      resultDiv.className = "p-4 rounded-xl border text-sm bg-amber-50 border-amber-200 text-amber-900 space-y-1";
-      resultDiv.innerHTML = `<strong>Signature valid, but this certificate has been REVOKED.</strong><br>Recipient: ${record.recipient_name}<br>Issued: ${record.issued_at}`;
-      return;
-    }
+    const revoked = data.status === "REVOKED";
+    resultDiv.className = revoked
+      ? "p-4 rounded-xl border text-sm bg-amber-50 border-amber-200 text-amber-900 space-y-2"
+      : "p-4 rounded-xl border text-sm bg-emerald-50 border-emerald-200 text-emerald-900 space-y-2";
 
-    resultDiv.className = "p-4 rounded-xl border text-sm bg-emerald-50 border-emerald-200 text-emerald-900 space-y-1";
-    resultDiv.innerHTML = `<strong>VERIFIED — Authentic & Active</strong><br>Recipient: ${record.recipient_name}<br>Event: ${record.event_id}<br>Issued: ${record.issued_at}`;
+    resultDiv.innerHTML = `
+      <div class="font-bold">${revoked ? "SIGNATURE VALID — REVOKED" : "VERIFIED — AUTHENTIC & ACTIVE"}</div>
+
+      <div class="grid grid-cols-1 gap-2 pt-2">
+        <div><span class="font-semibold">Certificate ID:</span> ${escapeHtml(data.cert_id)}</div>
+        <div><span class="font-semibold">Recipient:</span> ${escapeHtml(data.recipient_name || "(blank)")}</div>
+        <div><span class="font-semibold">Event:</span> ${escapeHtml(data.event_id)}</div>
+        <div><span class="font-semibold">Issued:</span> ${escapeHtml(data.issued_at)}</div>
+        <div><span class="font-semibold">Status:</span> ${escapeHtml(data.status || "ACTIVE")}</div>
+      </div>
+
+      <div class="border-t border-current/10 pt-2 mt-2 space-y-2 text-xs">
+        <div>
+          <div class="font-semibold">Permanent IPFS CID</div>
+          <div class="font-mono break-all">${escapeHtml(data.ipfs_cid || "Not pinned")}</div>
+        </div>
+        <div>
+          <div class="font-semibold">SHA-256</div>
+          <div class="font-mono break-all">${escapeHtml(data.data_hash)}</div>
+        </div>
+        <div>
+          <div class="font-semibold">Ed25519 Signature</div>
+          <div class="font-mono break-all">${escapeHtml(data.signature)}</div>
+        </div>
+        ${data.permanent_url ? `
+          <div>
+            <a href="${escapeHtml(data.permanent_url)}" target="_blank" rel="noopener noreferrer"
+               class="underline font-semibold">Open permanent IPFS record</a>
+          </div>
+        ` : ""}
+      </div>
+    `;
   } catch (err) {
     resultDiv.className = "p-4 rounded-xl border text-sm bg-red-50 border-red-200 text-red-800";
     resultDiv.innerText = "Could not reach backend to verify: " + err.message;
