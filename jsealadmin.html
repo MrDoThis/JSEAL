@@ -29,6 +29,7 @@
       <button onclick="switchTab('generator')" id="btnTabGenerator" class="flex-1 sm:flex-none px-4 py-2 rounded-lg bg-indigo-600 text-white shadow-sm transition">Visual Designer & Single Test</button>
       <button onclick="switchTab('batch')" id="btnTabBatch" class="flex-1 sm:flex-none px-4 py-2 rounded-lg hover:bg-slate-800 text-slate-300 transition">Batch Issuance</button>
       <button onclick="switchTab('verify')" id="btnTabVerify" class="flex-1 sm:flex-none px-4 py-2 rounded-lg hover:bg-slate-800 text-slate-300 transition">Verify Certificate</button>
+      <button onclick="switchTab('certs')" id="btnTabCerts" class="flex-1 sm:flex-none px-4 py-2 rounded-lg hover:bg-slate-800 text-slate-300 transition">My Certificates</button>
     </nav>
   </div>
 </header>
@@ -268,6 +269,30 @@
       <button onclick="verifyCertificate()" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2.5 rounded-lg text-sm transition">Verify</button>
     </div>
     <div id="verifyResult" class="hidden p-4 rounded-xl border text-sm"></div>
+  </section>
+
+  <!-- CERTIFICATES TAB: search everything ever issued, reprint any of them -->
+  <section id="tabCerts" class="hidden max-w-3xl mx-auto space-y-6">
+    <div class="bg-white p-5 sm:p-6 rounded-2xl shadow-sm border border-slate-200/80 space-y-4">
+      <div>
+        <h2 class="text-lg font-semibold text-slate-900">My Certificates</h2>
+        <p class="text-xs text-slate-500 mt-1">Search everything issued so far — by name, certificate number, or event. Partial matches work.</p>
+      </div>
+      <div class="flex flex-col sm:flex-row gap-2">
+        <input type="text" id="certSearchInput" placeholder="Search by name, number, or event..."
+               onkeydown="if(event.key==='Enter') searchCertificates()"
+               class="flex-grow rounded-lg border-slate-300 border px-3 py-2.5 text-sm">
+        <select id="certSearchField" class="rounded-lg border-slate-300 border px-3 py-2.5 text-sm bg-white">
+          <option value="all">All fields</option>
+          <option value="name">Name</option>
+          <option value="number">Certificate number</option>
+          <option value="event">Event</option>
+        </select>
+        <button onclick="searchCertificates()" class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2.5 px-5 rounded-lg text-sm transition shrink-0">Search</button>
+      </div>
+      <p class="text-[11px] text-slate-400">Reprinting uses whatever template and layout is currently loaded on the Visual Designer tab — load that first if you haven't this session.</p>
+      <div id="certSearchResults" class="space-y-2 max-h-[28rem] overflow-y-auto"></div>
+    </div>
   </section>
 
 </main>
@@ -1143,9 +1168,81 @@ async function verifyCertificate() {
   }
 }
 
+// ---------------------------------------------------------------
+// My Certificates: search everything ever issued, reprint any of them.
+// ---------------------------------------------------------------
+let lastSearchResults = [];
+
+function escapeHtml(s) {
+  return (s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+async function searchCertificates() {
+  const q = document.getElementById('certSearchInput').value.trim();
+  const field = document.getElementById('certSearchField').value;
+  const resultsDiv = document.getElementById('certSearchResults');
+
+  if (!q) { resultsDiv.innerHTML = '<p class="text-xs text-slate-400 px-1">Enter a search term.</p>'; return; }
+  resultsDiv.innerHTML = '<p class="text-xs text-slate-400 px-1">Searching...</p>';
+
+  try {
+    const res = await fetch(`${API_URL}/api/v1/certificates/search?q=${encodeURIComponent(q)}&field=${field}`);
+    if (!res.ok) throw new Error(`Server returned ${res.status}`);
+    const data = await res.json();
+    renderCertSearchResults(data.results);
+  } catch (err) {
+    resultsDiv.innerHTML = `<p class="text-xs text-red-600 px-1">Search failed: ${err.message}</p>`;
+  }
+}
+
+function renderCertSearchResults(results) {
+  lastSearchResults = results;
+  const resultsDiv = document.getElementById('certSearchResults');
+  if (!results.length) {
+    resultsDiv.innerHTML = '<p class="text-xs text-slate-400 px-1">No matching certificates.</p>';
+    return;
+  }
+  resultsDiv.innerHTML = results.map((r, i) => `
+    <div class="flex justify-between items-center bg-slate-50 border border-slate-200 rounded-lg px-3 py-2.5 text-xs gap-2">
+      <div class="min-w-0">
+        <strong>${escapeHtml(r.recipient_name) || '(unassigned)'}</strong>
+        ${r.status === 'REVOKED' ? '<span class="badge-danger">revoked</span>' : ''}
+        <br><span class="text-slate-400 break-all">${escapeHtml(r.cert_id)} · ${escapeHtml(r.event_id)} · ${r.issued_at ? r.issued_at.slice(0, 10) : ''}</span>
+      </div>
+      <div class="flex gap-1 shrink-0">
+        <button onclick="reprintCertificate(${i}, 'png')" class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-1.5 px-2.5 rounded-lg">PNG</button>
+        <button onclick="reprintCertificate(${i}, 'pdf')" class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-1.5 px-2.5 rounded-lg">PDF</button>
+      </div>
+    </div>`).join('');
+}
+
+async function reprintCertificate(index, format) {
+  const record = lastSearchResults[index];
+  if (!record) return;
+  if (!record.recipient_name) { alert('This certificate has no name assigned yet — assign one first from the Assign Names tab.'); return; }
+  if (!isTemplateLoaded) { alert('Load a template in the Visual Designer tab first, so the reprint has something to draw on.'); return; }
+
+  const verifyUrl = buildVerifyUrl(record.cert_id, record.ipfs_cid);
+  const tempCanvas = document.createElement('canvas');
+  await renderCertificateCanvasFor(record.recipient_name, record.cert_id, verifyUrl, tempCanvas);
+
+  if (format === 'png') {
+    const link = document.createElement('a');
+    link.download = `Certificate_${record.cert_id}.png`;
+    link.href = tempCanvas.toDataURL('image/png');
+    link.click();
+  } else {
+    const { jsPDF } = window.jspdf;
+    const isLandscape = templateImg.width >= templateImg.height;
+    const doc = new jsPDF({ orientation: isLandscape ? 'l' : 'p', unit: 'px', format: [templateImg.width, templateImg.height] });
+    doc.addImage(tempCanvas.toDataURL('image/png'), 'PNG', 0, 0, templateImg.width, templateImg.height);
+    doc.save(`Certificate_${record.cert_id}.pdf`);
+  }
+}
+
 function switchTab(tab) {
-  const tabs = { generator: 'tabGenerator', batch: 'tabBatch', verify: 'tabVerify' };
-  const btns = { generator: 'btnTabGenerator', batch: 'btnTabBatch', verify: 'btnTabVerify' };
+  const tabs = { generator: 'tabGenerator', batch: 'tabBatch', verify: 'tabVerify', certs: 'tabCerts' };
+  const btns = { generator: 'btnTabGenerator', batch: 'btnTabBatch', verify: 'btnTabVerify', certs: 'btnTabCerts' };
   Object.keys(tabs).forEach(t => {
     document.getElementById(tabs[t]).classList.toggle('hidden', t !== tab);
     document.getElementById(btns[t]).className = t === tab
