@@ -1,4 +1,5 @@
 import os, hashlib, json, time
+from contextlib import closing
 from datetime import datetime
 from typing import List
 from fastapi import FastAPI, HTTPException
@@ -7,6 +8,9 @@ from pydantic import BaseModel
 import nacl.signing
 import nacl.encoding
 import httpx
+import psycopg2
+import psycopg2.extras
+from psycopg2.pool import SimpleConnectionPool
 
 # --- CONFIG ---
 JSEAL_SIGNING_KEY = os.getenv("JSEAL_SIGNING_KEY", "").strip()
@@ -31,8 +35,106 @@ print(f"[JSeal] Pinata configured: {bool(PINATA_JWT)}")
 app = FastAPI(title="JSeal Permanent")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Simple in-memory store - replace with a real DB later if you want.
-DB = {}
+# ---------------------------------------------------------------------------
+# Persistence — hosted Postgres, independent of Render.
+#
+# This used to be a plain in-memory dict (then briefly a local SQLite file),
+# both of which tie the data's survival to whatever process/disk Render is
+# running at the time. A free Postgres instance on Neon or Supabase lives on
+# its own infrastructure: if Render has an outage, or you ever move hosts,
+# the data is untouched and a new backend can point at the same DATABASE_URL
+# and pick up exactly where things left off.
+#
+# Set DATABASE_URL to the connection string your provider gives you, e.g.
+#   postgresql://user:password@host:5432/dbname?sslmode=require
+# Neon/Supabase both include sslmode=require in the string they hand you —
+# don't strip it.
+# ---------------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is not set. Set it to your hosted Postgres connection "
+        "string (from Neon, Supabase, etc.) in your environment before starting the server."
+    )
+
+_pool = SimpleConnectionPool(minconn=1, maxconn=5, dsn=DATABASE_URL)
+
+
+def db_init():
+    conn = _pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS certificates (
+                    cert_id TEXT PRIMARY KEY,
+                    event_id TEXT NOT NULL,
+                    recipient_name TEXT NOT NULL DEFAULT '',
+                    issued_at TEXT NOT NULL,
+                    signature TEXT NOT NULL,
+                    data_hash TEXT NOT NULL,
+                    ipfs_cid TEXT,
+                    status TEXT NOT NULL DEFAULT 'ACTIVE'
+                )
+            """)
+        conn.commit()
+    finally:
+        _pool.putconn(conn)
+
+
+def db_get(cert_id: str):
+    conn = _pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM certificates WHERE cert_id = %s", (cert_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        _pool.putconn(conn)
+
+
+def db_set(cert_id: str, rec: dict):
+    row = {
+        "cert_id": cert_id,
+        "event_id": rec.get("event_id", ""),
+        "recipient_name": rec.get("recipient_name", ""),
+        "issued_at": rec.get("issued_at", ""),
+        "signature": rec.get("signature", ""),
+        "data_hash": rec.get("data_hash", ""),
+        "ipfs_cid": rec.get("ipfs_cid"),
+        "status": rec.get("status", "ACTIVE"),
+    }
+    conn = _pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO certificates (cert_id, event_id, recipient_name, issued_at, signature, data_hash, ipfs_cid, status)
+                VALUES (%(cert_id)s, %(event_id)s, %(recipient_name)s, %(issued_at)s, %(signature)s, %(data_hash)s, %(ipfs_cid)s, %(status)s)
+                ON CONFLICT (cert_id) DO UPDATE SET
+                    event_id = EXCLUDED.event_id,
+                    recipient_name = EXCLUDED.recipient_name,
+                    issued_at = EXCLUDED.issued_at,
+                    signature = EXCLUDED.signature,
+                    data_hash = EXCLUDED.data_hash,
+                    ipfs_cid = EXCLUDED.ipfs_cid,
+                    status = EXCLUDED.status
+            """, row)
+        conn.commit()
+    finally:
+        _pool.putconn(conn)
+
+
+def db_all():
+    conn = _pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM certificates ORDER BY issued_at DESC")
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        _pool.putconn(conn)
+
+
+db_init()
 
 
 def canonical(payload: dict) -> str:
@@ -106,7 +208,8 @@ def health():
         "status": "ok",
         "signing_key_available": True,
         "public_key_hex": PUBLIC_HEX,
-        "pinata": bool(PINATA_JWT)
+        "pinata": bool(PINATA_JWT),
+        "db": "postgres",
     }
 
 
@@ -117,8 +220,23 @@ def trust_root():
 
 @app.post("/api/v1/certificates/issue")
 async def issue(req: IssueReq):
-    if req.cert_id in DB and not req.force:
-        raise HTTPException(400, f"{req.cert_id} already exists - use force=true to overwrite")
+    existing = db_get(req.cert_id)
+    if existing:
+        existing_name = (existing.get("recipient_name") or "").strip().lower()
+        same_name = existing_name != "" and existing_name == req.recipient_name.strip().lower()
+        if same_name:
+            # Exact duplicate: same certificate number AND same recipient
+            # already on file. Nothing would actually change, so this is
+            # always blocked — force=true is for correcting a DIFFERENT
+            # detail under an existing number, not for re-running the same
+            # issuance twice.
+            raise HTTPException(
+                409,
+                f"Duplicate certificate: '{req.recipient_name}' already has certificate {req.cert_id} on file. "
+                f"Nothing to regenerate — use the Certificates search tab to reprint the existing one."
+            )
+        if not req.force:
+            raise HTTPException(400, f"{req.cert_id} already exists - use force=true to overwrite")
 
     payload = {
         "cert_id": req.cert_id,
@@ -141,7 +259,7 @@ async def issue(req: IssueReq):
     bundle["permanent_url"] = f"https://gateway.pinata.cloud/ipfs/{cid}" if cid else None
     bundle["arweave_tx_id"] = cid  # keep frontend compat - it uses this field for the verify url
 
-    DB[req.cert_id] = {**payload, "signature": sig_hex, "data_hash": data_hash, "ipfs_cid": cid, "status": "ACTIVE"}
+    db_set(req.cert_id, {**payload, "signature": sig_hex, "data_hash": data_hash, "ipfs_cid": cid, "status": "ACTIVE"})
 
     return {
         "cert_id": req.cert_id,
@@ -156,7 +274,7 @@ async def issue(req: IssueReq):
 
 @app.get("/api/v1/certificates/verify/{cert_id}")
 def verify(cert_id: str):
-    rec = DB.get(cert_id)
+    rec = db_get(cert_id)
     if not rec:
         return {"found": False, "cert_id": cert_id}
     return {"found": True, **rec}
@@ -164,7 +282,34 @@ def verify(cert_id: str):
 
 @app.get("/api/v1/certificates/pending")
 def pending():
-    return [v for v in DB.values() if not v.get("recipient_name")]
+    return [v for v in db_all() if not v.get("recipient_name")]
+
+
+@app.get("/api/v1/certificates/search")
+def search(q: str = "", field: str = "all"):
+    """
+    Partial, case-insensitive search over every certificate ever issued —
+    by recipient name, certificate number, event ID, or all three.
+    field: "name" | "number" | "event" | "all" (default)
+    """
+    term = q.strip().lower()
+    if not term:
+        return {"results": [], "count": 0}
+
+    def matches(rec):
+        name = (rec.get("recipient_name") or "").lower()
+        cid = (rec.get("cert_id") or "").lower()
+        evt = (rec.get("event_id") or "").lower()
+        if field == "name":
+            return term in name
+        if field == "number":
+            return term in cid
+        if field == "event":
+            return term in evt
+        return term in name or term in cid or term in evt
+
+    results = [r for r in db_all() if matches(r)]
+    return {"results": results, "count": len(results)}
 
 
 @app.post("/api/v1/certificates/batch-issue")
@@ -200,14 +345,15 @@ async def preprint_batch(req: PreprintReq):
 
 @app.post("/api/v1/certificates/{cert_id}/assign")
 async def assign(cert_id: str, body: AssignReq):
-    rec = DB.get(cert_id)
+    rec = db_get(cert_id)
     if not rec:
         raise HTTPException(404, "not found")
-    rec["recipient_name"] = body.recipient_name
     payload = {"cert_id": rec["cert_id"], "event_id": rec["event_id"], "recipient_name": body.recipient_name, "issued_at": rec["issued_at"]}
     sig, h = sign_payload(payload)
+    rec["recipient_name"] = body.recipient_name
     rec["signature"] = sig
     rec["data_hash"] = h
+    db_set(cert_id, rec)
     return {"payload": payload, "data_hash": h, "signature": sig, "arweave_tx_id": rec.get("ipfs_cid")}
 
 
@@ -218,7 +364,7 @@ async def assign_batch(req: AssignBatchReq):
     certs = []
     failed = []
     for r in req.records:
-        rec = DB.get(r.cert_id)
+        rec = db_get(r.cert_id)
         if not rec:
             failed.append({"recipient_name": r.recipient_name, "cert_id": r.cert_id, "reason": "certificate ID not found"})
             continue
