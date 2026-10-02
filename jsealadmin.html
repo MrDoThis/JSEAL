@@ -157,6 +157,12 @@
           <input type="file" id="csvInput" accept=".csv" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer">
           <p class="text-xs font-medium text-emerald-800">Tap to upload CSV: Name, CertificateID (CertificateID column optional)</p>
         </div>
+        <div class="space-y-2">
+          <label class="block text-xs font-semibold text-slate-600 uppercase tracking-wider">Or paste names (one per line)</label>
+          <textarea id="pasteNamesInput" class="w-full h-28 text-xs font-mono bg-white border border-slate-300 rounded-lg p-2" placeholder="John Doe&#10;Jane Smith&#10;Mary Johnson, wtd2024-015"></textarea>
+          <p class="text-[11px] text-slate-400">One name per line. Optionally add a Certificate ID after a comma or tab. Pasting straight from Excel/Sheets works too.</p>
+          <button type="button" onclick="loadPastedNames()" class="w-full bg-emerald-100 hover:bg-emerald-200 text-emerald-800 font-medium py-2 rounded-lg text-xs transition">Load Pasted Names</button>
+        </div>
         <textarea id="csvPreview" readonly class="w-full h-24 text-xs font-mono bg-slate-50 border border-slate-200 rounded-lg p-2" placeholder="Loaded rows will appear here..."></textarea>
         <label class="flex items-center gap-2 text-xs text-slate-500">
           <input type="checkbox" id="batchForceOverwrite"> Overwrite any rows whose Certificate ID already exists
@@ -238,6 +244,12 @@
         <div class="relative border-2 border-dashed border-indigo-300 rounded-xl p-3 text-center hover:border-indigo-500 transition bg-indigo-50/30 cursor-pointer">
           <input type="file" id="assignFileInput" accept=".csv,.xlsx" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer">
           <p class="text-xs font-medium text-indigo-800">Tap to upload CSV or XLSX: CertificateID, Name</p>
+        </div>
+        <div class="space-y-2">
+          <label class="block text-xs font-semibold text-slate-600 uppercase tracking-wider">Or paste Certificate ID + Name (one per line)</label>
+          <textarea id="pasteAssignInput" class="w-full h-28 text-xs font-mono bg-white border border-slate-300 rounded-lg p-2" placeholder="wtd2024-001, John Doe&#10;wtd2024-002, Jane Smith&#10;wtd2024-003&#9;Mary Johnson"></textarea>
+          <p class="text-[11px] text-slate-400">Certificate ID first, then the name, separated by a comma or a tab. Pasting two columns straight from Excel/Sheets works too. Only the first comma/tab splits the line, so names like "Smith, John" stay intact.</p>
+          <button type="button" onclick="loadPastedAssignments()" class="w-full bg-indigo-100 hover:bg-indigo-200 text-indigo-800 font-medium py-2 rounded-lg text-xs transition">Load Pasted Assignments</button>
         </div>
         <textarea id="assignFilePreview" readonly class="w-full h-24 text-xs font-mono bg-slate-50 border border-slate-200 rounded-lg p-2" placeholder="Loaded rows will appear here..."></textarea>
         <label class="flex items-center gap-2 text-xs text-slate-500">
@@ -1256,6 +1268,61 @@ window.onload = () => {
   checkBackendConnection();
   setInterval(checkBackendConnection, 15000);
 };
+
+// Paste names in bulk: feeds the same pendingBatchRecords used by the CSV upload
+function loadPastedNames() {
+  const raw = document.getElementById('pasteNamesInput').value;
+  const lines = raw.split(/\r\n|\n/).map(l => l.trim()).filter(l => l.length > 0);
+
+  // Skip a header row if one was pasted
+  const first = (lines[0] || '').toLowerCase();
+  const startIndex = (first === 'name' || first.startsWith('name,') || first.startsWith('name\t')) ? 1 : 0;
+
+  pendingBatchRecords = [];
+  for (let i = startIndex; i < lines.length; i++) {
+    const cols = lines[i].split(/\t|,/).map(c => c.trim().replace(/^["']|["']$/g, ''));
+    if (cols[0]) pendingBatchRecords.push({ recipient_name: cols[0], cert_id: cols[1] || null });
+  }
+
+  document.getElementById('csvPreview').value = pendingBatchRecords
+    .map(r => `${r.recipient_name}${r.cert_id ? ' -> ' + r.cert_id : ' (auto-ID)'}`)
+    .join('\n');
+  document.getElementById('btnProcessBatch').disabled = pendingBatchRecords.length === 0;
+}
+
+// Paste Certificate ID + Name in bulk: feeds the same pendingAssignRecords
+// used by the CSV/XLSX upload, so "Assign From File" works unchanged.
+function loadPastedAssignments() {
+  const raw = document.getElementById('pasteAssignInput').value;
+  const lines = raw.split(/\r\n|\n/).map(l => l.trim()).filter(l => l.length > 0);
+
+  // Skip a header row if one was pasted (e.g. "Certificate ID, Name")
+  const headerPattern = /^["']?(certificate\s*id|certificate\s*number|cert\s*id|cert\s*no|id)["']?\s*[\t,]/i;
+  const startIndex = (lines[0] && headerPattern.test(lines[0])) ? 1 : 0;
+
+  pendingAssignRecords = [];
+  const skipped = [];
+
+  for (let i = startIndex; i < lines.length; i++) {
+    // Split on the FIRST tab or comma only, so names containing commas survive
+    const match = lines[i].match(/^([^\t,]+)[\t,]\s*(.+)$/);
+    if (!match) { skipped.push(lines[i]); continue; }
+
+    const certId = match[1].trim().replace(/^["']|["']$/g, '');
+    const name = match[2].trim().replace(/^["']|["']$/g, '');
+
+    if (certId && name) pendingAssignRecords.push({ cert_id: certId, recipient_name: name });
+    else skipped.push(lines[i]);
+  }
+
+  let preview = pendingAssignRecords.map(r => `${r.cert_id} -> ${r.recipient_name}`).join('\n');
+  if (skipped.length) {
+    preview += `${preview ? '\n\n' : ''}SKIPPED (need an ID and a name):\n` + skipped.join('\n');
+  }
+
+  document.getElementById('assignFilePreview').value = preview;
+  document.getElementById('btnProcessAssign').disabled = pendingAssignRecords.length === 0;
+}
 </script>
 </body>
 </html>
