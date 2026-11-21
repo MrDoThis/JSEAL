@@ -2,8 +2,8 @@ name: Keep Supabase Alive
 
 on:
   schedule:
-    # Runs every 3 days at 08:00 UTC
-    - cron: '0 8 */3 * *'
+    # Runs daily at 08:00 UTC
+    - cron: '0 8 * * *'
   workflow_dispatch:
 
 jobs:
@@ -15,6 +15,22 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          curl -s "$SUPABASE_URL/rest/v1/certificates?select=id&limit=1" \
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_KEY" ]; then
+            echo "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY secret."
+            exit 1
+          fi
+
+          BASE_URL="${SUPABASE_URL%/}"
+          STATUS=$(curl -s -o /tmp/response.txt -w "%{http_code}" \
+            "$BASE_URL/rest/v1/certificates?select=id&limit=1" \
             -H "apikey: $SUPABASE_KEY" \
-            -H "Authorization: Bearer $SUPABASE_KEY"
+            -H "Authorization: Bearer $SUPABASE_KEY")
+
+          echo "HTTP Status: $STATUS"
+          cat /tmp/response.txt
+          echo ""
+
+          if [ "$STATUS" -lt 200 ] || [ "$STATUS" -ge 300 ]; then
+            echo "Supabase ping failed with status $STATUS"
+            exit 1
+          fi
